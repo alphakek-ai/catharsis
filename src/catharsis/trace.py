@@ -72,17 +72,20 @@ class TraceWriter:
         prompt: str,
         response: str,
         response_lengths: ResponseLengths,
+        raw_response: str | None = None,
     ):
         """Write immediately after student model generates a response."""
-        self._write(
-            "response",
-            gen=generation,
-            cand=candidate,
-            idx=prompt_idx,
-            prompt=prompt,
-            response=response,
-            lengths=asdict(response_lengths),
-        )
+        data: dict = {
+            "gen": generation,
+            "cand": candidate,
+            "idx": prompt_idx,
+            "prompt": prompt,
+            "response": response,
+            "lengths": asdict(response_lengths),
+        }
+        if raw_response is not None and raw_response != response:
+            data["raw_response"] = raw_response
+        self._write("response", **data)
 
     def write_verdict(
         self,

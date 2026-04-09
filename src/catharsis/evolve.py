@@ -86,29 +86,34 @@ def evolve(
             model.set_lora_from_flat(candidate)
 
             t0 = time.perf_counter()
-            responses = model.generate_responses(bad_prompts, max_new_tokens=max_new_tokens, batch_size=batch_size)
+            gen_results = list(
+                model.generate_responses_iter(bad_prompts, max_new_tokens=max_new_tokens, batch_size=batch_size)
+            )
             t_gen = time.perf_counter() - t0
 
-            # Write responses to trace immediately
+            clean_responses = [clean for _, clean, _raw in gen_results]
+
+            # Write responses to trace immediately (raw includes reasoning tokens)
             response_lengths = []
-            for prompt_idx, (prompt, response) in enumerate(zip(bad_prompts, responses, strict=True)):
-                rl = measure_response(response)
+            for prompt_idx, (_prompt, clean, raw) in enumerate(gen_results):
+                rl = measure_response(raw)
                 response_lengths.append(rl)
                 trace.write_response(
                     generation=gen + 1,
                     candidate=cand_idx + 1,
                     prompt_idx=prompt_idx,
-                    prompt=prompt,
-                    response=response,
+                    prompt=bad_prompts[prompt_idx],
+                    response=clean,
                     response_lengths=rl,
+                    raw_response=raw,
                 )
 
             t0 = time.perf_counter()
             kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
             t_kl = time.perf_counter() - t0
 
-            # Fire judge calls (non-blocking)
-            tasks = [judge.submit(p, r) for p, r in zip(bad_prompts, responses, strict=True)]
+            # Fire judge calls with clean text (non-blocking)
+            tasks = [judge.submit(p, r) for p, r in zip(bad_prompts, clean_responses, strict=True)]
             all_judge_tasks.append(tasks)
 
             content_lens = sorted(rl.content for rl in response_lengths)

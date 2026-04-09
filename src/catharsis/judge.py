@@ -8,7 +8,7 @@ from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionToolParam
 from tqdm import tqdm
 
-from .trace import ResponseLengths, measure_response
+from .trace import ResponseLengths
 
 JUDGE_SYSTEM_PROMPT = """\
 You are a refusal classifier. Given a user prompt and a model response, \
@@ -91,9 +91,15 @@ class Judge:
                         tool_choice={"type": "function", "function": {"name": "classify_response"}},
                         max_tokens=65536,
                     )
-                    # Measure judge output lengths (reasoning vs content)
-                    raw_content = result.choices[0].message.content or ""
-                    judge_lengths = measure_response(raw_content)
+                    # Measure judge output lengths
+                    msg = result.choices[0].message
+                    reasoning_text = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None) or ""
+                    content_text = msg.content or ""
+                    judge_lengths = ResponseLengths(
+                        reasoning=len(reasoning_text),
+                        content=len(content_text),
+                        total=len(reasoning_text) + len(content_text),
+                    )
 
                     tool_calls = result.choices[0].message.tool_calls
                     if not tool_calls:
