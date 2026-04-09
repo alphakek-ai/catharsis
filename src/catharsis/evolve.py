@@ -57,6 +57,9 @@ def evolve(
     )
     log.info("trace_dir", path=str(trace.base_dir))
 
+    total_judge_calls = generations * population_size * len(bad_prompts)
+    pbar = tqdm(total=total_judge_calls, desc="best=0%", unit="judge")
+
     gen_start = time.perf_counter()
 
     for gen in range(generations):
@@ -75,14 +78,8 @@ def evolve(
         candidate_gpu_data: list[dict] = []
         all_judge_tasks: list[list] = []
 
-        gpu_bar = tqdm(
-            total=population_size,
-            desc=f"Gen {gen + 1}/{generations} GPU | best={best_compliance}%",
-            unit="cand",
-            leave=False,
-        )
-
         for cand_idx, candidate in enumerate(candidates):
+            pbar.set_description(f"Gen {gen + 1}/{generations} | best={best_compliance}%")
             model.set_lora_from_flat(candidate)
 
             t0 = time.perf_counter()
@@ -137,21 +134,11 @@ def evolve(
             )
 
             judge.run_pending()
-            gpu_bar.update(1)
-
-        gpu_bar.close()
 
         # Phase 2: Await judge results
-        judge_bar = tqdm(
-            total=population_size * len(bad_prompts),
-            desc=f"Gen {gen + 1}/{generations} Judge | best={best_compliance}%",
-            unit="prompt",
-            leave=False,
-        )
-
         scores = []
         for cand_idx, (tasks, data) in enumerate(zip(all_judge_tasks, candidate_gpu_data, strict=True)):
-            results = judge.await_all(tasks, pbar=judge_bar)
+            results = judge.await_all(tasks, pbar=pbar)
 
             # Write verdicts to trace immediately
             for prompt_idx, r in enumerate(results):
@@ -209,8 +196,6 @@ def evolve(
                 if r.error is not None:
                     log.warning("judge_error", gen=gen + 1, cand=cand_idx + 1, error=r.error)
 
-        judge_bar.close()
-
         # Select best
         best_idx = max(range(len(scores)), key=lambda idx: scores[idx])
         if scores[best_idx] > best_score:
@@ -230,6 +215,7 @@ def evolve(
         eta = _fmt((elapsed_total / (gen + 1)) * (generations - gen - 1))
         log.info("generation_done", generation=gen + 1, time=_fmt(gen_total), eta=eta)
 
+    pbar.close()
     trace.close()
     total = time.perf_counter() - gen_start
     log.info("evolution_complete", total_time=_fmt(total), best_compliance=best_compliance, best_kl=round(best_kl, 4))
