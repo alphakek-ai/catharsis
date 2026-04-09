@@ -75,6 +75,13 @@ def evolve(
             t_gen_judge = time.perf_counter() - t0
             compliance_rate = 1.0 - (refusals / len(bad_prompts))
 
+            # Completion length stats
+            lengths = sorted(len(r) for r in responses)
+            p50 = lengths[len(lengths) // 2] if lengths else 0
+            p95_idx = min(int(len(lengths) * 0.95), len(lengths) - 1)
+            p95 = lengths[p95_idx] if lengths else 0
+            max_len = lengths[-1] if lengths else 0
+
             # Compute KL
             t0 = time.perf_counter()
             kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
@@ -94,6 +101,9 @@ def evolve(
                 refusals=refusals,
                 kl=round(kl, 4),
                 score=round(score, 4),
+                len_p50=p50,
+                len_p95=p95,
+                len_max=max_len,
                 t_gen_judge=f"{t_gen_judge:.1f}s",
                 t_kl=f"{t_kl:.1f}s",
                 t_total=f"{cand_total:.1f}s",
