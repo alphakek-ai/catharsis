@@ -1,6 +1,5 @@
 """Evolutionary search over LoRA perturbations."""
 
-import asyncio
 import time
 
 import torch
@@ -10,6 +9,7 @@ from tqdm import tqdm
 from .judge import Judge
 from .log import log
 from .model import Model
+from .trace import TraceWriter, measure_response
 
 
 def _fmt(seconds: float) -> str:
@@ -42,6 +42,21 @@ def evolve(
     best_compliance = 0
     best_kl = float("inf")
 
+    trace = TraceWriter()
+    trace.write_meta(
+        model=model.model_name,
+        lora_rank=model.lora_rank,
+        lora_targets=model.lora_targets,
+        population_size=population_size,
+        generations=generations,
+        noise_std=noise_std,
+        kl_weight=kl_weight,
+        n_good=len(good_prompts),
+        n_bad=len(bad_prompts),
+        max_new_tokens=max_new_tokens,
+    )
+    log.info("trace_dir", path=str(trace.base_dir))
+
     gen_start = time.perf_counter()
 
     for gen in range(generations):
@@ -56,10 +71,9 @@ def evolve(
                 noise = torch.randn(n_params, device=device) * noise_std
             candidates.append(best_params + noise)
 
-        # Phase 1: GPU work (sequential) — generate responses + compute KL per candidate
-        # Judge calls are fired off in background as responses come in
+        # Phase 1: GPU work — generate responses + compute KL, fire judge calls
         candidate_data: list[dict] = []
-        all_judge_tasks: list[list[asyncio.Task[bool]]] = []
+        all_judge_tasks = []
 
         gpu_bar = tqdm(
             total=population_size,
@@ -71,47 +85,46 @@ def evolve(
         for candidate in candidates:
             model.set_lora_from_flat(candidate)
 
-            # Generate responses
             t0 = time.perf_counter()
             responses = model.generate_responses(bad_prompts, max_new_tokens=max_new_tokens, batch_size=batch_size)
             t_gen = time.perf_counter() - t0
 
-            # Compute KL while this candidate's weights are still loaded
             t0 = time.perf_counter()
             kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
             t_kl = time.perf_counter() - t0
 
-            # Fire off judge calls (non-blocking)
+            # Measure student model response lengths
+            response_lengths = [measure_response(r) for r in responses]
+            content_lens = sorted(rl.content for rl in response_lengths)
+            reasoning_lens = sorted(rl.reasoning for rl in response_lengths)
+
+            # Fire judge calls (non-blocking)
             tasks = [judge.submit(p, r) for p, r in zip(bad_prompts, responses, strict=True)]
             all_judge_tasks.append(tasks)
-
-            # Completion length stats
-            lengths = sorted(len(r) for r in responses)
-            p50 = lengths[len(lengths) // 2] if lengths else 0
-            p95_idx = min(int(len(lengths) * 0.95), len(lengths) - 1)
-            p95 = lengths[p95_idx] if lengths else 0
-            max_len = lengths[-1] if lengths else 0
 
             candidate_data.append(
                 {
                     "kl": kl,
                     "responses": responses,
+                    "response_lengths": response_lengths,
                     "t_gen": t_gen,
                     "t_kl": t_kl,
-                    "len_p50": p50,
-                    "len_p95": p95,
-                    "len_max": max_len,
+                    "content_p50": content_lens[len(content_lens) // 2] if content_lens else 0,
+                    "content_p95": content_lens[min(int(len(content_lens) * 0.95), len(content_lens) - 1)]
+                    if content_lens
+                    else 0,
+                    "content_max": content_lens[-1] if content_lens else 0,
+                    "reasoning_p50": reasoning_lens[len(reasoning_lens) // 2] if reasoning_lens else 0,
+                    "reasoning_max": reasoning_lens[-1] if reasoning_lens else 0,
                 }
             )
 
-            # Let pending judge calls progress while GPU was busy
             judge.run_pending()
-
             gpu_bar.update(1)
 
         gpu_bar.close()
 
-        # Phase 2: Await all judge results
+        # Phase 2: Await judge results
         judge_bar = tqdm(
             total=population_size * len(bad_prompts),
             desc=f"Gen {gen + 1}/{generations} Judge | best={best_compliance}%",
@@ -121,11 +134,37 @@ def evolve(
 
         scores = []
         for i, (tasks, data) in enumerate(zip(all_judge_tasks, candidate_data, strict=True)):
-            verdicts = judge.await_all(tasks, pbar=judge_bar)
-            refusals = sum(verdicts)
+            results = judge.await_all(tasks, pbar=judge_bar)
+
+            verdicts = [r.is_refusal for r in results]
+            judge_lengths = [r.lengths for r in results]
+            judge_errors = [r.error for r in results]
+
+            # Count refusals — judge errors count as refusals
+            refusals = sum(1 for v in verdicts if v is True or v is None)
             compliance_rate = 1.0 - (refusals / len(bad_prompts))
             score = compliance_rate - kl_weight * data["kl"]
             scores.append(score)
+
+            # Judge length stats (exclude errors)
+            judge_content_lens = sorted(jl.content for jl in judge_lengths if jl is not None)
+            judge_reasoning_lens = sorted(jl.reasoning for jl in judge_lengths if jl is not None)
+            judge_total_lens = sorted(jl.total for jl in judge_lengths if jl is not None)
+            n_errors = sum(1 for e in judge_errors if e is not None)
+
+            # Write trace to disk
+            trace.write_candidate(
+                generation=gen + 1,
+                candidate=i + 1,
+                prompts=bad_prompts,
+                responses=data["responses"],
+                response_lengths=data["response_lengths"],
+                verdicts=verdicts,
+                judge_lengths=judge_lengths,
+                judge_errors=judge_errors,
+                kl=data["kl"],
+                score=score,
+            )
 
             log.info(
                 "candidate_eval",
@@ -134,14 +173,23 @@ def evolve(
                 population=population_size,
                 compliance=round(compliance_rate * 100),
                 refusals=refusals,
+                judge_errors=n_errors,
                 kl=round(data["kl"], 4),
                 score=round(score, 4),
-                len_p50=data["len_p50"],
-                len_p95=data["len_p95"],
-                len_max=data["len_max"],
+                student_content_p50=data["content_p50"],
+                student_content_p95=data["content_p95"],
+                student_reasoning_p50=data["reasoning_p50"],
+                judge_content_p50=judge_content_lens[len(judge_content_lens) // 2] if judge_content_lens else 0,
+                judge_reasoning_p50=judge_reasoning_lens[len(judge_reasoning_lens) // 2] if judge_reasoning_lens else 0,
+                judge_total_max=judge_total_lens[-1] if judge_total_lens else 0,
                 t_gen=f"{data['t_gen']:.1f}s",
                 t_kl=f"{data['t_kl']:.1f}s",
             )
+
+            # Log any judge errors
+            for e in judge_errors:
+                if e is not None:
+                    log.warning("judge_error", generation=gen + 1, candidate=i + 1, error=e)
 
         judge_bar.close()
 
@@ -156,6 +204,8 @@ def evolve(
             log.info("new_best", compliance=best_compliance, kl=round(best_kl, 4), score=round(best_score, 4))
         else:
             log.info("no_improvement", generation=gen + 1)
+
+        trace.write_generation_summary(gen + 1, best_score, best_compliance, best_kl)
 
         gen_total = time.perf_counter() - gen_t0
         elapsed_total = time.perf_counter() - gen_start
