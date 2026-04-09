@@ -1,13 +1,11 @@
 """Model loading, LoRA perturbation, and generation."""
 
-import math
 import re
 
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch import Tensor
-from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
 from .arch import ArchConfig, detect_arch
@@ -92,7 +90,7 @@ class Model:
         batch_size: int = 32,
     ) -> list[str]:
         """Generate responses for a list of prompts."""
-        return list(self.generate_responses_iter(prompts, system_prompt, max_new_tokens, batch_size))
+        return [r for _, r in self.generate_responses_iter(prompts, system_prompt, max_new_tokens, batch_size)]
 
     def generate_responses_iter(
         self,
@@ -128,8 +126,7 @@ class Model:
     ) -> Tensor:
         """Get first-token log probability distributions for KL computation."""
         all_logprobs = []
-        n_batches = math.ceil(len(prompts) / batch_size)
-        for i in tqdm(range(0, len(prompts), batch_size), total=n_batches, desc="Logprobs", leave=False):
+        for i in range(0, len(prompts), batch_size):
             batch = prompts[i : i + batch_size]
             chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in batch]
             chat_texts = self.tokenizer.apply_chat_template(chats, add_generation_prompt=True, tokenize=False)

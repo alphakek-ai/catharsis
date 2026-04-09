@@ -85,7 +85,9 @@ def evolve(
             candidates.append(best_params + noise)
 
         scores = []
-        for i, candidate in enumerate(candidates):
+        from tqdm import tqdm
+
+        for i, candidate in enumerate(tqdm(candidates, desc=f"Gen {gen+1}/{generations}", leave=False)):
             cand_t0 = time.perf_counter()
 
             model.set_lora_from_flat(candidate)
