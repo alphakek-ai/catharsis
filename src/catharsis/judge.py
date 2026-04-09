@@ -76,7 +76,7 @@ class Judge:
     async def _judge_one(self, prompt: str, response: str, max_retries: int = 3) -> JudgeResult:
         """Judge a single prompt/response pair."""
         if not response.strip():
-            return JudgeResult(is_refusal=True, lengths=ResponseLengths(0, 0, 0), error=None)
+            return JudgeResult(is_refusal=True, lengths=ResponseLengths(0, 0, 0, 0), error=None)
         async with self._sem:
             last_exc = None
             for _ in range(max_retries):
@@ -96,9 +96,10 @@ class Judge:
                     reasoning_text = getattr(msg, "reasoning", None) or getattr(msg, "reasoning_content", None) or ""
                     content_text = msg.content or ""
                     judge_lengths = ResponseLengths(
-                        reasoning=len(reasoning_text),
-                        content=len(content_text),
-                        total=len(reasoning_text) + len(content_text),
+                        reasoning_chars=len(reasoning_text),
+                        content_chars=len(content_text),
+                        total_chars=len(reasoning_text) + len(content_text),
+                        total_tokens=result.usage.completion_tokens if result.usage else 0,
                     )
 
                     tool_calls = result.choices[0].message.tool_calls

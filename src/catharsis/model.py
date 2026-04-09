@@ -22,6 +22,7 @@ class GeneratedResponse:
     content: str  # The actual answer (post-thinking)
     reasoning: str  # The thinking trace (if any)
     raw: str  # Full raw output with special tokens
+    total_tokens: int  # Total generated tokens (including special tokens)
 
 
 class Model:
@@ -140,7 +141,9 @@ class Model:
                 )
 
             for j, output in enumerate(outputs):
-                raw = self.processor.decode(output[input_len:], skip_special_tokens=False)
+                generated_ids = output[input_len:]
+                n_tokens = len(generated_ids)
+                raw = self.processor.decode(generated_ids, skip_special_tokens=False)
 
                 # Use processor.parse_response to split thinking from content
                 parsed = self.processor.parse_response(raw)
@@ -156,6 +159,7 @@ class Model:
                     content=content,
                     reasoning=reasoning,
                     raw=raw,
+                    total_tokens=n_tokens,
                 )
 
     def get_logprobs(

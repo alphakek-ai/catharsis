@@ -95,9 +95,10 @@ def evolve(
             response_lengths = []
             for prompt_idx, resp in enumerate(gen_results):
                 rl = ResponseLengths(
-                    reasoning=len(resp.reasoning),
-                    content=len(resp.content),
-                    total=len(resp.raw),
+                    reasoning_chars=len(resp.reasoning),
+                    content_chars=len(resp.content),
+                    total_chars=len(resp.raw),
+                    total_tokens=resp.total_tokens,
                 )
                 response_lengths.append(rl)
                 trace.write_response(
@@ -107,7 +108,7 @@ def evolve(
                     prompt=resp.prompt,
                     response=resp.content,
                     response_lengths=rl,
-                    raw_response=resp.raw if resp.reasoning else None,
+                    raw_response=resp.raw if resp.raw != resp.content else None,
                 )
 
             t0 = time.perf_counter()
@@ -118,20 +119,20 @@ def evolve(
             tasks = [judge.submit(p, r.content) for p, r in zip(bad_prompts, gen_results, strict=True)]
             all_judge_tasks.append(tasks)
 
-            content_lens = sorted(rl.content for rl in response_lengths)
-            reasoning_lens = sorted(rl.reasoning for rl in response_lengths)
+            token_lens = sorted(rl.total_tokens for rl in response_lengths)
+            reasoning_lens = sorted(rl.reasoning_chars for rl in response_lengths)
 
             candidate_gpu_data.append(
                 {
                     "kl": kl,
                     "t_gen": t_gen,
                     "t_kl": t_kl,
-                    "content_p50": content_lens[len(content_lens) // 2] if content_lens else 0,
-                    "content_p95": content_lens[min(int(len(content_lens) * 0.95), len(content_lens) - 1)]
-                    if content_lens
+                    "tokens_p50": token_lens[len(token_lens) // 2] if token_lens else 0,
+                    "tokens_p95": token_lens[min(int(len(token_lens) * 0.95), len(token_lens) - 1)]
+                    if token_lens
                     else 0,
-                    "reasoning_p50": reasoning_lens[len(reasoning_lens) // 2] if reasoning_lens else 0,
-                    "reasoning_max": reasoning_lens[-1] if reasoning_lens else 0,
+                    "tokens_max": token_lens[-1] if token_lens else 0,
+                    "reasoning_chars_p50": reasoning_lens[len(reasoning_lens) // 2] if reasoning_lens else 0,
                 }
             )
 
@@ -169,9 +170,9 @@ def evolve(
             score = compliance_rate - kl_weight * data["kl"]
             scores.append(score)
 
-            judge_content_lens = sorted(r.lengths.content for r in results if r.lengths is not None)
-            judge_reasoning_lens = sorted(r.lengths.reasoning for r in results if r.lengths is not None)
-            judge_total_lens = sorted(r.lengths.total for r in results if r.lengths is not None)
+            judge_content_lens = sorted(r.lengths.content_chars for r in results if r.lengths is not None)
+            judge_reasoning_lens = sorted(r.lengths.reasoning_chars for r in results if r.lengths is not None)
+            judge_total_lens = sorted(r.lengths.total_chars for r in results if r.lengths is not None)
 
             trace.write_candidate_summary(
                 generation=gen + 1,
@@ -193,9 +194,10 @@ def evolve(
                 judge_errors=n_errors,
                 kl=round(data["kl"], 4),
                 score=round(score, 4),
-                student_content_p50=data["content_p50"],
-                student_content_p95=data["content_p95"],
-                student_reasoning_p50=data["reasoning_p50"],
+                student_tokens_p50=data["tokens_p50"],
+                student_tokens_p95=data["tokens_p95"],
+                student_tokens_max=data["tokens_max"],
+                student_reasoning_p50=data["reasoning_chars_p50"],
                 judge_content_p50=judge_content_lens[len(judge_content_lens) // 2] if judge_content_lens else 0,
                 judge_reasoning_p50=judge_reasoning_lens[len(judge_reasoning_lens) // 2] if judge_reasoning_lens else 0,
                 judge_total_max=judge_total_lens[-1] if judge_total_lens else 0,

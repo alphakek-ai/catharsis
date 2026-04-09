@@ -1,7 +1,6 @@
 """Trace writer — append-only JSONL for crash-safe logging of all model outputs."""
 
 import json
-import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -9,43 +8,12 @@ from pathlib import Path
 
 @dataclass
 class ResponseLengths:
-    """Character lengths of different parts of a model response."""
+    """Lengths of different parts of a model response."""
 
-    reasoning: int
-    content: int
-    total: int
-
-
-# Patterns for extracting reasoning traces from different model families
-_THINKING_PATTERNS = [
-    # Gemma 4: <|channel>thought\n...<channel|>
-    re.compile(r"<\|channel>thought\n.*?<channel\|>", re.DOTALL),
-    # Qwen3/3.5: <think>...</think>
-    re.compile(r"<think>.*?</think>", re.DOTALL),
-    # Generic: <|think|>...(until end or next tag)
-    re.compile(r"<\|think\|>.*?(?=<|$)", re.DOTALL),
-]
-
-
-def measure_response(raw_text: str) -> ResponseLengths:
-    """Measure reasoning vs content length in a model response."""
-    total = len(raw_text)
-    reasoning_len = 0
-    content_text = raw_text
-
-    for pattern in _THINKING_PATTERNS:
-        matches = pattern.findall(content_text)
-        if matches:
-            for match in matches:
-                reasoning_len += len(match)
-            content_text = pattern.sub("", content_text).strip()
-            break
-
-    return ResponseLengths(
-        reasoning=reasoning_len,
-        content=len(content_text),
-        total=total,
-    )
+    reasoning_chars: int
+    content_chars: int
+    total_chars: int
+    total_tokens: int
 
 
 class TraceWriter:
