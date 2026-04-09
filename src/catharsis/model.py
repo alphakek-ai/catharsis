@@ -33,7 +33,7 @@ class Model:
         lora_targets: list[str] | None = None,
         dtype: str = "auto",
         device_map: str = "auto",
-        enable_thinking: bool = False,
+        enable_thinking: bool = True,
     ):
         self.model_name = model_name
         self.lora_rank = lora_rank
