@@ -1,0 +1,46 @@
+name: Dev Updates
+
+on:
+  push:
+    branches:
+      - master
+  schedule:
+    - cron: '0 */12 * * *'
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - uses: alphakek-ai/dev-updates-action@v1
+        with:
+          cooldown: '12h'
+          channels: |
+            - name: backend-updates
+              type: telegram
+              chat_id: "-1002852734125"
+              thread_id: 4
+              mode: dev
+
+            - name: alphakek-groupchat
+              type: telegram
+              chat_id: "-1001982990617"
+              mode: dev
+
+            - name: aikek-agent-twitter
+              type: twitter
+              mode: community
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TWITTER_API_KEY: ${{ secrets.TWITTER_API_KEY }}
+          TWITTER_API_SECRET: ${{ secrets.TWITTER_API_SECRET }}
+          TWITTER_ACCESS_TOKEN: ${{ secrets.TWITTER_ACCESS_TOKEN }}
+          TWITTER_ACCESS_TOKEN_SECRET: ${{ secrets.TWITTER_ACCESS_TOKEN_SECRET }}
