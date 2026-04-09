@@ -57,8 +57,9 @@ def evolve(
     )
     log.info("trace_dir", path=str(trace.base_dir))
 
-    total_judge_calls = generations * population_size * len(bad_prompts)
-    pbar = tqdm(total=total_judge_calls, desc="best=0%", unit="judge")
+    prompts_per_candidate = len(bad_prompts)
+    total_steps = generations * population_size * prompts_per_candidate * 2  # generate + judge
+    pbar = tqdm(total=total_steps, desc="best=0%", unit="step")
 
     gen_start = time.perf_counter()
 
@@ -83,14 +84,13 @@ def evolve(
             model.set_lora_from_flat(candidate)
 
             t0 = time.perf_counter()
-            gen_results = list(
-                model.generate_responses_iter(bad_prompts, max_new_tokens=max_new_tokens, batch_size=batch_size)
-            )
-            t_gen = time.perf_counter() - t0
-
-            # Write responses to trace immediately
+            gen_results = []
             response_lengths = []
-            for prompt_idx, resp in enumerate(gen_results):
+            for prompt_idx, resp in enumerate(
+                model.generate_responses_iter(bad_prompts, max_new_tokens=max_new_tokens, batch_size=batch_size)
+            ):
+                gen_results.append(resp)
+                pbar.update(1)  # tick for each generated response
                 rl = ResponseLengths(
                     reasoning_chars=len(resp.reasoning),
                     content_chars=len(resp.content),
@@ -107,6 +107,7 @@ def evolve(
                     response_lengths=rl,
                     raw_response=resp.raw if resp.raw != resp.content else None,
                 )
+            t_gen = time.perf_counter() - t0
 
             t0 = time.perf_counter()
             kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
