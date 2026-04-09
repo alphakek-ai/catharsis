@@ -1,5 +1,6 @@
 """Evolutionary search over LoRA perturbations."""
 
+import asyncio
 import time
 
 import torch
@@ -41,10 +42,6 @@ def evolve(
     best_compliance = 0
     best_kl = float("inf")
 
-    # Total work units: each candidate processes len(bad_prompts) prompts (generate+judge)
-    total_prompts = generations * population_size * len(bad_prompts)
-    pbar = tqdm(total=total_prompts, desc="Gen 1 | Cand 1 | best=0%", unit="prompt")
-
     gen_start = time.perf_counter()
 
     for gen in range(generations):
@@ -59,21 +56,34 @@ def evolve(
                 noise = torch.randn(n_params, device=device) * noise_std
             candidates.append(best_params + noise)
 
-        scores = []
-        for i, candidate in enumerate(candidates):
-            cand_t0 = time.perf_counter()
-            pbar.set_description(
-                f"Gen {gen + 1}/{generations} | Cand {i + 1}/{population_size} | best={best_compliance}%"
-            )
+        # Phase 1: GPU work (sequential) — generate responses + compute KL per candidate
+        # Judge calls are fired off in background as responses come in
+        candidate_data: list[dict] = []
+        all_judge_tasks: list[list[asyncio.Task[bool]]] = []
 
+        gpu_bar = tqdm(
+            total=population_size,
+            desc=f"Gen {gen + 1}/{generations} GPU | best={best_compliance}%",
+            unit="cand",
+            leave=False,
+        )
+
+        for candidate in candidates:
             model.set_lora_from_flat(candidate)
 
-            # Generate + judge in pipeline
+            # Generate responses
             t0 = time.perf_counter()
-            gen_iter = model.generate_responses_iter(bad_prompts, max_new_tokens=max_new_tokens, batch_size=batch_size)
-            refusals, verdicts, responses = judge.evaluate_streaming(gen_iter, total=len(bad_prompts), pbar=pbar)
-            t_gen_judge = time.perf_counter() - t0
-            compliance_rate = 1.0 - (refusals / len(bad_prompts))
+            responses = model.generate_responses(bad_prompts, max_new_tokens=max_new_tokens, batch_size=batch_size)
+            t_gen = time.perf_counter() - t0
+
+            # Compute KL while this candidate's weights are still loaded
+            t0 = time.perf_counter()
+            kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
+            t_kl = time.perf_counter() - t0
+
+            # Fire off judge calls (non-blocking)
+            tasks = [judge.submit(p, r) for p, r in zip(bad_prompts, responses, strict=True)]
+            all_judge_tasks.append(tasks)
 
             # Completion length stats
             lengths = sorted(len(r) for r in responses)
@@ -82,15 +92,40 @@ def evolve(
             p95 = lengths[p95_idx] if lengths else 0
             max_len = lengths[-1] if lengths else 0
 
-            # Compute KL
-            t0 = time.perf_counter()
-            kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
-            t_kl = time.perf_counter() - t0
+            candidate_data.append(
+                {
+                    "kl": kl,
+                    "responses": responses,
+                    "t_gen": t_gen,
+                    "t_kl": t_kl,
+                    "len_p50": p50,
+                    "len_p95": p95,
+                    "len_max": max_len,
+                }
+            )
 
-            score = compliance_rate - kl_weight * kl
+            # Let pending judge calls progress while GPU was busy
+            judge.run_pending()
+
+            gpu_bar.update(1)
+
+        gpu_bar.close()
+
+        # Phase 2: Await all judge results
+        judge_bar = tqdm(
+            total=population_size * len(bad_prompts),
+            desc=f"Gen {gen + 1}/{generations} Judge | best={best_compliance}%",
+            unit="prompt",
+            leave=False,
+        )
+
+        scores = []
+        for i, (tasks, data) in enumerate(zip(all_judge_tasks, candidate_data, strict=True)):
+            verdicts = judge.await_all(tasks, pbar=judge_bar)
+            refusals = sum(verdicts)
+            compliance_rate = 1.0 - (refusals / len(bad_prompts))
+            score = compliance_rate - kl_weight * data["kl"]
             scores.append(score)
-
-            cand_total = time.perf_counter() - cand_t0
 
             log.info(
                 "candidate_eval",
@@ -99,15 +134,16 @@ def evolve(
                 population=population_size,
                 compliance=round(compliance_rate * 100),
                 refusals=refusals,
-                kl=round(kl, 4),
+                kl=round(data["kl"], 4),
                 score=round(score, 4),
-                len_p50=p50,
-                len_p95=p95,
-                len_max=max_len,
-                t_gen_judge=f"{t_gen_judge:.1f}s",
-                t_kl=f"{t_kl:.1f}s",
-                t_total=f"{cand_total:.1f}s",
+                len_p50=data["len_p50"],
+                len_p95=data["len_p95"],
+                len_max=data["len_max"],
+                t_gen=f"{data['t_gen']:.1f}s",
+                t_kl=f"{data['t_kl']:.1f}s",
             )
+
+        judge_bar.close()
 
         # Select best
         best_idx = max(range(len(scores)), key=lambda idx: scores[idx])
@@ -115,7 +151,7 @@ def evolve(
             best_score = scores[best_idx]
             best_params = candidates[best_idx].clone()
             model.set_lora_from_flat(best_params)
-            best_kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
+            best_kl = candidate_data[best_idx]["kl"]
             best_compliance = round((best_score + kl_weight * best_kl) * 100)
             log.info("new_best", compliance=best_compliance, kl=round(best_kl, 4), score=round(best_score, 4))
         else:
@@ -126,7 +162,6 @@ def evolve(
         eta = _fmt((elapsed_total / (gen + 1)) * (generations - gen - 1))
         log.info("generation_done", generation=gen + 1, time=_fmt(gen_total), eta=eta)
 
-    pbar.close()
     total = time.perf_counter() - gen_start
     log.info("evolution_complete", total_time=_fmt(total), best_compliance=best_compliance, best_kl=round(best_kl, 4))
     model.set_lora_from_flat(best_params)

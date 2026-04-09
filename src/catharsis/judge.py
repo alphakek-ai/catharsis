@@ -52,6 +52,8 @@ class Judge:
     def __init__(self, api_base: str, model: str | None = None, concurrency: int = 32):
         self.client = AsyncOpenAI(base_url=api_base, api_key="unused", timeout=86400.0)
         self.concurrency = concurrency
+        self._loop = asyncio.new_event_loop()
+        self._sem = asyncio.Semaphore(concurrency)
 
         if model is None:
             import requests
@@ -61,11 +63,11 @@ class Judge:
             model = r.json()["data"][0]["id"]
         self.model = model
 
-    async def _judge_one(self, sem: asyncio.Semaphore, prompt: str, response: str, max_retries: int = 3) -> bool:
+    async def _judge_one(self, prompt: str, response: str, max_retries: int = 3) -> bool:
         """Returns True if refusal, False if compliance."""
         if not response.strip():
             return True
-        async with sem:
+        async with self._sem:
             last_exc = None
             for _ in range(max_retries):
                 try:
@@ -93,62 +95,34 @@ class Judge:
                 f"Model output was: {response[:500]!r}"
             ) from last_exc
 
-    def evaluate(self, prompts: list[str], responses: list[str]) -> tuple[int, list[bool]]:
-        """Judge a batch of prompt/response pairs. Returns (refusal_count, verdicts)."""
-        sem = asyncio.Semaphore(self.concurrency)
-        pbar = tqdm(total=len(prompts), desc="Judging", leave=False)
+    def submit(self, prompt: str, response: str) -> asyncio.Task[bool]:
+        """Fire off a judge call without waiting. Returns a Task to await later."""
+        return self._loop.create_task(self._judge_one(prompt, response))
 
-        async def judge_one_with_progress(prompt: str, response: str) -> bool:
-            try:
-                return await self._judge_one(sem, prompt, response)
-            finally:
-                pbar.update(1)
+    def await_all(self, tasks: list[asyncio.Task[bool]], pbar: tqdm | None = None) -> list[bool]:
+        """Wait for all submitted judge tasks to complete. Returns verdicts."""
 
-        async def run_all():
-            tasks = [judge_one_with_progress(p, r) for p, r in zip(prompts, responses, strict=True)]
-            return await asyncio.gather(*tasks)
+        async def gather():
+            results = []
+            for task in asyncio.as_completed(tasks):
+                result = await task
+                results.append(result)
+                if pbar:
+                    pbar.update(1)
+            return results
 
-        try:
-            verdicts = asyncio.run(run_all())
-        finally:
-            pbar.close()
+        # as_completed doesn't preserve order, so we need a different approach
+        async def gather_ordered():
+            verdicts = []
+            for task in tasks:
+                verdict = await task
+                verdicts.append(verdict)
+                if pbar:
+                    pbar.update(1)
+            return verdicts
 
-        refusal_count = sum(verdicts)
-        return refusal_count, verdicts
+        return self._loop.run_until_complete(gather_ordered())
 
-    def evaluate_streaming(self, gen_iter, total: int, pbar: tqdm | None = None) -> tuple[int, list[bool], list[str]]:
-        """Judge responses as they stream in from generation.
-
-        GPU generates batch N+1 while the judge processes batch N.
-        Returns (refusal_count, verdicts, responses).
-        """
-        sem = asyncio.Semaphore(self.concurrency)
-
-        async def judge_one_tracked(prompt: str, response: str, idx: int, results: dict):
-            verdict = await self._judge_one(sem, prompt, response)
-            results[idx] = verdict
-            if pbar:
-                pbar.update(1)
-
-        def run():
-            loop = asyncio.new_event_loop()
-            pending: list[asyncio.Task] = []
-            results: dict[int, bool] = {}
-            responses: list[str] = []
-            idx = 0
-
-            for prompt, response in gen_iter:
-                responses.append(response)
-                task = loop.create_task(judge_one_tracked(prompt, response, idx, results))
-                pending.append(task)
-                idx += 1
-
-            # Wait for all remaining judge calls
-            if pending:
-                loop.run_until_complete(asyncio.gather(*pending))
-            loop.close()
-
-            verdicts = [results[i] for i in range(len(responses))]
-            return sum(verdicts), verdicts, responses
-
-        return run()
+    def run_pending(self):
+        """Run one iteration of the event loop to let pending judge calls progress."""
+        self._loop.run_until_complete(asyncio.sleep(0))
