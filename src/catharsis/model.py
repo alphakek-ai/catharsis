@@ -143,8 +143,12 @@ class Model:
                 )
 
             tokenizer = self.processor.tokenizer
+            pad_id = tokenizer.pad_token_id
             for j, output in enumerate(outputs):
                 generated_ids = output[input_len:]
+                # Strip padding tokens
+                if pad_id is not None:
+                    generated_ids = generated_ids[generated_ids != pad_id]
                 n_tokens = len(generated_ids)
                 raw = self.processor.decode(generated_ids, skip_special_tokens=False)
 
