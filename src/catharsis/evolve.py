@@ -90,15 +90,11 @@ def evolve(
 
             model.set_lora_from_flat(candidate)
 
-            # Generate responses
+            # Generate + judge in pipeline (GPU generates batch N+1 while judge processes batch N)
             t0 = time.perf_counter()
-            responses = model.generate_responses(bad_prompts, max_new_tokens=max_new_tokens, batch_size=batch_size)
-            t_gen = time.perf_counter() - t0
-
-            # Judge compliance
-            t0 = time.perf_counter()
-            refusals, verdicts = judge.evaluate(bad_prompts, responses)
-            t_judge = time.perf_counter() - t0
+            gen_iter = model.generate_responses_iter(bad_prompts, max_new_tokens=max_new_tokens, batch_size=batch_size)
+            refusals, verdicts, responses = judge.evaluate_streaming(gen_iter, total=len(bad_prompts))
+            t_gen_judge = time.perf_counter() - t0
             compliance_rate = 1.0 - (refusals / len(bad_prompts))
 
             # Compute KL
@@ -120,8 +116,7 @@ def evolve(
                 refusals=refusals,
                 kl=round(kl, 4),
                 score=round(score, 4),
-                t_gen=f"{t_gen:.1f}s",
-                t_judge=f"{t_judge:.1f}s",
+                t_gen_judge=f"{t_gen_judge:.1f}s",
                 t_kl=f"{t_kl:.1f}s",
                 t_total=f"{cand_total:.1f}s",
             )

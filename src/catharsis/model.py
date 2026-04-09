@@ -92,9 +92,17 @@ class Model:
         batch_size: int = 32,
     ) -> list[str]:
         """Generate responses for a list of prompts."""
-        all_responses = []
-        n_batches = math.ceil(len(prompts) / batch_size)
-        for i in tqdm(range(0, len(prompts), batch_size), total=n_batches, desc="Generating", leave=False):
+        return list(self.generate_responses_iter(prompts, system_prompt, max_new_tokens, batch_size))
+
+    def generate_responses_iter(
+        self,
+        prompts: list[str],
+        system_prompt: str = "You are a helpful assistant.",
+        max_new_tokens: int = 1000,
+        batch_size: int = 32,
+    ):
+        """Yield (prompt, response) pairs as each batch completes."""
+        for i in range(0, len(prompts), batch_size):
             batch = prompts[i : i + batch_size]
             chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in batch]
             chat_texts = self.tokenizer.apply_chat_template(chats, add_generation_prompt=True, tokenize=False)
@@ -108,10 +116,9 @@ class Model:
                     do_sample=False,
                     pad_token_id=self.tokenizer.pad_token_id,
                 )
-            for output in outputs:
+            for j, output in enumerate(outputs):
                 response = self.tokenizer.decode(output[inputs["input_ids"].shape[1] :], skip_special_tokens=True)
-                all_responses.append(response)
-        return all_responses
+                yield batch[j], response
 
     def get_logprobs(
         self,
