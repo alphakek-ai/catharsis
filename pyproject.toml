@@ -17,6 +17,8 @@ dependencies = [
     "tqdm>=4.67",
     "typer>=0.24",
     "structlog>=25.1",
+    "pillow>=12.2.0",
+    "torchvision>=0.26.0",
 ]
 
 [project.scripts]
