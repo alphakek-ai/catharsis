@@ -116,20 +116,18 @@ class Judge:
         refusal_count = sum(verdicts)
         return refusal_count, verdicts
 
-    def evaluate_streaming(self, gen_iter, total: int) -> tuple[int, list[bool], list[str]]:
+    def evaluate_streaming(self, gen_iter, total: int, pbar: tqdm | None = None) -> tuple[int, list[bool], list[str]]:
         """Judge responses as they stream in from generation.
 
         GPU generates batch N+1 while the judge processes batch N.
         Returns (refusal_count, verdicts, responses).
         """
         sem = asyncio.Semaphore(self.concurrency)
-        pbar = tqdm(total=total, desc="Generate+Judge", leave=False)
 
         async def judge_one_tracked(prompt: str, response: str, idx: int, results: dict):
-            try:
-                verdict = await self._judge_one(sem, prompt, response)
-                results[idx] = verdict
-            finally:
+            verdict = await self._judge_one(sem, prompt, response)
+            results[idx] = verdict
+            if pbar:
                 pbar.update(1)
 
         def run():
@@ -149,7 +147,6 @@ class Judge:
             if pending:
                 loop.run_until_complete(asyncio.gather(*pending))
             loop.close()
-            pbar.close()
 
             verdicts = [results[i] for i in range(len(responses))]
             return sum(verdicts), verdicts, responses

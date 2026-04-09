@@ -4,6 +4,7 @@ import time
 
 import torch
 from torch import Tensor
+from tqdm import tqdm
 
 from .judge import Judge
 from .log import log
@@ -32,19 +33,6 @@ def evolve(
     batch_size: int = 32,
     max_new_tokens: int = 1000,
 ) -> Tensor:
-    """
-    Evolutionary search over LoRA parameters.
-
-    For each generation:
-    1. Sample `population_size` perturbations around the current best
-    2. For each perturbation, generate responses to bad prompts
-    3. Judge compliance with LLM judge
-    4. Compute KL divergence on good prompts
-    5. Score = compliance_rate - kl_weight * kl_divergence
-    6. Select the best, repeat
-
-    Returns the best LoRA parameter vector found.
-    """
     n_params = model.lora_param_count()
     device = model.device
 
@@ -53,27 +41,14 @@ def evolve(
     best_compliance = 0
     best_kl = float("inf")
 
+    # Total work units: each candidate processes len(bad_prompts) prompts (generate+judge)
+    total_prompts = generations * population_size * len(bad_prompts)
+    pbar = tqdm(total=total_prompts, desc="Gen 1 | Cand 1 | best=0%", unit="prompt")
+
     gen_start = time.perf_counter()
 
     for gen in range(generations):
         gen_t0 = time.perf_counter()
-        elapsed_total = gen_t0 - gen_start
-
-        eta = ""
-        if gen > 0:
-            avg_gen = elapsed_total / gen
-            eta = _fmt(avg_gen * (generations - gen))
-
-        log.info(
-            "generation_start",
-            generation=gen + 1,
-            total=generations,
-            best_compliance=best_compliance,
-            best_kl=round(best_kl, 4),
-            best_score=round(best_score, 4),
-            elapsed=_fmt(elapsed_total),
-            eta=eta,
-        )
 
         # Generate perturbations
         candidates = []
@@ -85,17 +60,18 @@ def evolve(
             candidates.append(best_params + noise)
 
         scores = []
-        from tqdm import tqdm
-
-        for i, candidate in enumerate(tqdm(candidates, desc=f"Gen {gen + 1}/{generations}", leave=False)):
+        for i, candidate in enumerate(candidates):
             cand_t0 = time.perf_counter()
+            pbar.set_description(
+                f"Gen {gen + 1}/{generations} | Cand {i + 1}/{population_size} | best={best_compliance}%"
+            )
 
             model.set_lora_from_flat(candidate)
 
-            # Generate + judge in pipeline (GPU generates batch N+1 while judge processes batch N)
+            # Generate + judge in pipeline
             t0 = time.perf_counter()
             gen_iter = model.generate_responses_iter(bad_prompts, max_new_tokens=max_new_tokens, batch_size=batch_size)
-            refusals, verdicts, responses = judge.evaluate_streaming(gen_iter, total=len(bad_prompts))
+            refusals, verdicts, responses = judge.evaluate_streaming(gen_iter, total=len(bad_prompts), pbar=pbar)
             t_gen_judge = time.perf_counter() - t0
             compliance_rate = 1.0 - (refusals / len(bad_prompts))
 
@@ -131,14 +107,16 @@ def evolve(
             model.set_lora_from_flat(best_params)
             best_kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
             best_compliance = round((best_score + kl_weight * best_kl) * 100)
-
             log.info("new_best", compliance=best_compliance, kl=round(best_kl, 4), score=round(best_score, 4))
         else:
             log.info("no_improvement", generation=gen + 1)
 
         gen_total = time.perf_counter() - gen_t0
-        log.info("generation_done", generation=gen + 1, time=_fmt(gen_total))
+        elapsed_total = time.perf_counter() - gen_start
+        eta = _fmt((elapsed_total / (gen + 1)) * (generations - gen - 1))
+        log.info("generation_done", generation=gen + 1, time=_fmt(gen_total), eta=eta)
 
+    pbar.close()
     total = time.perf_counter() - gen_start
     log.info("evolution_complete", total_time=_fmt(total), best_compliance=best_compliance, best_kl=round(best_kl, 4))
     model.set_lora_from_flat(best_params)
