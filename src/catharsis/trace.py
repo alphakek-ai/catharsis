@@ -1,4 +1,4 @@
-"""Trace writer — saves all model outputs and judge verdicts to disk for analysis."""
+"""Trace writer — append-only JSONL for crash-safe logging of all model outputs."""
 
 import json
 import re
@@ -53,70 +53,89 @@ class TraceWriter:
         self.run_id = f"run_{int(time.time())}"
         self.base_dir = Path(output_dir) / self.run_id
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        self._trace_path = self.base_dir / "trace.jsonl"
+        self._f = open(self._trace_path, "a")  # noqa: SIM115
+
+    def _write(self, event: str, **data):
+        line = {"ts": time.time(), "event": event, **data}
+        self._f.write(json.dumps(line, ensure_ascii=False, default=str) + "\n")
+        self._f.flush()
 
     def write_meta(self, **kwargs):
-        with open(self.base_dir / "meta.json", "w") as f:
-            json.dump(kwargs, f, indent=2, default=str)
+        self._write("meta", **kwargs)
 
-    def write_candidate(
+    def write_response(
         self,
         generation: int,
         candidate: int,
-        prompts: list[str],
-        responses: list[str],
-        response_lengths: list[ResponseLengths],
-        verdicts: list[bool | None],
-        judge_lengths: list[ResponseLengths | None],
-        judge_errors: list[str | None],
+        prompt_idx: int,
+        prompt: str,
+        response: str,
+        response_lengths: ResponseLengths,
+    ):
+        """Write immediately after student model generates a response."""
+        self._write(
+            "response",
+            gen=generation,
+            cand=candidate,
+            idx=prompt_idx,
+            prompt=prompt,
+            response=response,
+            lengths=asdict(response_lengths),
+        )
+
+    def write_verdict(
+        self,
+        generation: int,
+        candidate: int,
+        prompt_idx: int,
+        is_refusal: bool | None,
+        judge_lengths: ResponseLengths | None,
+        judge_error: str | None,
+    ):
+        """Write immediately after judge returns a verdict."""
+        data: dict = {
+            "gen": generation,
+            "cand": candidate,
+            "idx": prompt_idx,
+        }
+        if is_refusal is not None:
+            data["is_refusal"] = is_refusal
+        if judge_lengths is not None:
+            data["judge_lengths"] = asdict(judge_lengths)
+        if judge_error is not None:
+            data["judge_error"] = judge_error
+        self._write("verdict", **data)
+
+    def write_candidate_summary(
+        self,
+        generation: int,
+        candidate: int,
+        refusals: int,
+        compliance: int,
+        judge_errors: int,
         kl: float,
         score: float,
     ):
-        gen_dir = self.base_dir / f"gen_{generation:04d}"
-        gen_dir.mkdir(exist_ok=True)
-
-        records = []
-        for i in range(len(prompts)):
-            record: dict = {
-                "prompt": prompts[i],
-                "response": responses[i],
-                "response_lengths": asdict(response_lengths[i]),
-            }
-            if i < len(verdicts) and verdicts[i] is not None:
-                record["is_refusal"] = verdicts[i]
-            jl = judge_lengths[i] if i < len(judge_lengths) else None
-            if jl is not None:
-                record["judge_lengths"] = asdict(jl)
-            if i < len(judge_errors) and judge_errors[i] is not None:
-                record["judge_error"] = judge_errors[i]
-            records.append(record)
-
-        n_verdicts = [v for v in verdicts if v is not None]
-        data = {
-            "generation": generation,
-            "candidate": candidate,
-            "kl": kl,
-            "score": score,
-            "refusals": sum(1 for v in n_verdicts if v),
-            "compliance": sum(1 for v in n_verdicts if not v),
-            "judge_errors": sum(1 for e in judge_errors if e is not None),
-            "records": records,
-        }
-
-        with open(gen_dir / f"cand_{candidate:04d}.json", "w") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        self._write(
+            "candidate_summary",
+            gen=generation,
+            cand=candidate,
+            refusals=refusals,
+            compliance=compliance,
+            judge_errors=judge_errors,
+            kl=kl,
+            score=score,
+        )
 
     def write_generation_summary(self, generation: int, best_score: float, best_compliance: int, best_kl: float):
-        gen_dir = self.base_dir / f"gen_{generation:04d}"
-        gen_dir.mkdir(exist_ok=True)
+        self._write(
+            "generation_summary",
+            gen=generation,
+            best_score=best_score,
+            best_compliance=best_compliance,
+            best_kl=best_kl,
+        )
 
-        with open(gen_dir / "summary.json", "w") as f:
-            json.dump(
-                {
-                    "generation": generation,
-                    "best_score": best_score,
-                    "best_compliance": best_compliance,
-                    "best_kl": best_kl,
-                },
-                f,
-                indent=2,
-            )
+    def close(self):
+        self._f.close()
