@@ -1,12 +1,15 @@
 """Model loading, LoRA perturbation, and generation."""
 
-from typing import Any
+import re
 
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch import Tensor
 from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+
+from .arch import ArchConfig, detect_arch
+from .log import log
 
 
 class Model:
@@ -18,12 +21,8 @@ class Model:
         dtype: str = "auto",
         device_map: str = "auto",
     ):
-        if lora_targets is None:
-            lora_targets = ["down_proj", "gate_proj", "up_proj"]
-
         self.model_name = model_name
         self.lora_rank = lora_rank
-        self.lora_targets = lora_targets
 
         self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(model_name)
         if self.tokenizer.pad_token is None:
@@ -35,9 +34,19 @@ class Model:
         )
         self.base_model.eval()
 
+        # Detect architecture and configure LoRA targets
+        self.arch: ArchConfig = detect_arch(self.base_model.config)
+        self.lora_targets = lora_targets or self.arch.default_lora_targets
+        log.info("arch_detected", model_type=getattr(self.base_model.config, "model_type", "unknown"), layers_path=self.arch.layers_path, lora_targets=self.lora_targets)
+
+        # Scope LoRA to the transformer layers path to avoid unsupported
+        # module types in vision/audio towers (e.g. Gemma4ClippableLinear).
+        leaf_names = "|".join(re.escape(t) for t in self.lora_targets)
+        target_modules = f"{re.escape(self.arch.layers_path)}\\..*\\.({leaf_names})"
+
         self.peft_config = LoraConfig(
             r=lora_rank,
-            target_modules=lora_targets,
+            target_modules=target_modules,
             lora_alpha=lora_rank,
             lora_dropout=0,
             bias="none",
@@ -45,20 +54,13 @@ class Model:
         )
         self.model: PeftModel = get_peft_model(self.base_model, self.peft_config)
 
-        # Cache base logprobs for KL computation
-        self._base_logprobs_cache: dict[str, Tensor] = {}
-
     @property
     def device(self) -> torch.device:
         return next(self.model.parameters()).device
 
     def get_lora_params(self) -> list[Tensor]:
         """Get all LoRA A and B weight tensors."""
-        params = []
-        for name, param in self.model.named_parameters():
-            if "lora_" in name and param.requires_grad:
-                params.append(param)
-        return params
+        return [p for _, p in self.model.named_parameters() if "lora_" in _ and p.requires_grad]
 
     def zero_lora(self):
         """Reset all LoRA weights to zero (identity)."""
@@ -91,19 +93,11 @@ class Model:
         all_responses = []
         for i in range(0, len(prompts), batch_size):
             batch = prompts[i : i + batch_size]
-            chats = [
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": p},
-                ]
-                for p in batch
-            ]
-            chat_texts = self.tokenizer.apply_chat_template(
-                chats, add_generation_prompt=True, tokenize=False
+            chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in batch]
+            chat_texts = self.tokenizer.apply_chat_template(chats, add_generation_prompt=True, tokenize=False)
+            inputs = self.tokenizer(chat_texts, return_tensors="pt", padding=True, return_token_type_ids=False).to(
+                self.device
             )
-            inputs = self.tokenizer(
-                chat_texts, return_tensors="pt", padding=True, return_token_type_ids=False
-            ).to(self.device)
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
@@ -111,10 +105,8 @@ class Model:
                     do_sample=False,
                     pad_token_id=self.tokenizer.pad_token_id,
                 )
-            for j, output in enumerate(outputs):
-                response = self.tokenizer.decode(
-                    output[inputs["input_ids"].shape[1] :], skip_special_tokens=True
-                )
+            for output in outputs:
+                response = self.tokenizer.decode(output[inputs["input_ids"].shape[1] :], skip_special_tokens=True)
                 all_responses.append(response)
         return all_responses
 
@@ -128,19 +120,11 @@ class Model:
         all_logprobs = []
         for i in range(0, len(prompts), batch_size):
             batch = prompts[i : i + batch_size]
-            chats = [
-                [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": p},
-                ]
-                for p in batch
-            ]
-            chat_texts = self.tokenizer.apply_chat_template(
-                chats, add_generation_prompt=True, tokenize=False
+            chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in batch]
+            chat_texts = self.tokenizer.apply_chat_template(chats, add_generation_prompt=True, tokenize=False)
+            inputs = self.tokenizer(chat_texts, return_tensors="pt", padding=True, return_token_type_ids=False).to(
+                self.device
             )
-            inputs = self.tokenizer(
-                chat_texts, return_tensors="pt", padding=True, return_token_type_ids=False
-            ).to(self.device)
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,

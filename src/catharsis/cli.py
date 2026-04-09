@@ -33,11 +33,8 @@ def run(
 
     setup_logging()
 
-    if lora_targets is None:
-        lora_targets = ["down_proj", "gate_proj", "up_proj"]
-
     log.info("loading_model", model=model, lora_rank=lora_rank, lora_targets=lora_targets)
-    m = Model(model_name=model, lora_rank=lora_rank, lora_targets=lora_targets)
+    m = Model(model_name=model, lora_rank=lora_rank, lora_targets=lora_targets or None)
     log.info("model_loaded", lora_params=m.lora_param_count())
 
     log.info("setting_up_judge", api_base=judge_api_base, model=judge_model)

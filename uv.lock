@@ -11,7 +11,7 @@ resolution-markers = [
 ]
 
 [options]
-exclude-newer = "2026-04-02T11:53:56.93054273Z"
+exclude-newer = "2026-04-02T11:55:12.845861333Z"
 exclude-newer-span = "P7D"
 
 [[package]]
@@ -192,7 +192,7 @@ requires-dist = [
     { name = "structlog", specifier = ">=25.1" },
     { name = "torch", specifier = ">=2.10" },
     { name = "tqdm", specifier = ">=4.67" },
-    { name = "transformers", specifier = ">=5.4" },
+    { name = "transformers", git = "https://github.com/huggingface/transformers.git" },
     { name = "typer", specifier = ">=0.24" },
 ]
 
@@ -1713,8 +1713,8 @@ wheels = [
 
 [[package]]
 name = "transformers"
-version = "5.4.0"
-source = { registry = "https://pypi.org/simple" }
+version = "5.6.0.dev0"
+source = { git = "https://github.com/huggingface/transformers.git#e0b41d7bebd9f769fd0cf682a5458661e655c832" }
 dependencies = [
     { name = "huggingface-hub" },
     { name = "numpy" },
@@ -1725,10 +1725,6 @@ dependencies = [
     { name = "tokenizers" },
     { name = "tqdm" },
     { name = "typer" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/0b/4c/42a8e1c7bbe668d8e073941ec3205263afb1cd02683fa5a8a75e615fdfbe/transformers-5.4.0.tar.gz", hash = "sha256:cb34ca89dce345ae3224b290346b9c0fa9694b951d54f3ed16334a4b1bfe3d04", size = 8152836, upload-time = "2026-03-27T00:24:24.692Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/0b/a0/0a87883e564e364baab32adcacb4bec2e200b28a568423c8cf7fde316461/transformers-5.4.0-py3-none-any.whl", hash = "sha256:9fbe50602d2a4e6d0aa8a35a605433dfac72d595ee2192eae192590a6cc2df86", size = 10105556, upload-time = "2026-03-27T00:24:21.735Z" },
 ]
 
 [[package]]
