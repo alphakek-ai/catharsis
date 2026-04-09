@@ -8,11 +8,10 @@ from pathlib import Path
 
 @dataclass
 class ResponseLengths:
-    """Lengths of different parts of a model response."""
+    """Token counts for different parts of a model response."""
 
-    reasoning_chars: int
-    content_chars: int
-    total_chars: int
+    reasoning_tokens: int
+    content_tokens: int
     total_tokens: int
 
 

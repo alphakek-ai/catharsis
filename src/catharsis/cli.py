@@ -20,7 +20,7 @@ def run(
     noise_std: Annotated[float, typer.Option(help="Perturbation noise std")] = 0.001,
     kl_weight: Annotated[float, typer.Option(help="KL divergence penalty weight")] = 1.0,
     batch_size: Annotated[int, typer.Option(help="Inference batch size")] = 32,
-    max_new_tokens: Annotated[int, typer.Option(help="Max tokens per response")] = 1000,
+    max_new_tokens: Annotated[int, typer.Option(help="Max tokens per response")] = 2000,
     n_eval: Annotated[int, typer.Option(help="Number of eval prompts")] = 100,
     output_dir: Annotated[Optional[str], typer.Option(help="Output directory")] = None,
 ):

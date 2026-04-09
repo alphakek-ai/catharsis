@@ -22,7 +22,9 @@ class GeneratedResponse:
     content: str  # The actual answer (post-thinking)
     reasoning: str  # The thinking trace (if any)
     raw: str  # Full raw output with special tokens
-    total_tokens: int  # Total generated tokens (including special tokens)
+    total_tokens: int  # Total generated tokens
+    reasoning_tokens: int  # Tokens in the thinking trace
+    content_tokens: int  # Tokens in the actual answer
 
 
 class Model:
@@ -140,6 +142,7 @@ class Model:
                     pad_token_id=self.processor.tokenizer.pad_token_id,
                 )
 
+            tokenizer = self.processor.tokenizer
             for j, output in enumerate(outputs):
                 generated_ids = output[input_len:]
                 n_tokens = len(generated_ids)
@@ -154,12 +157,17 @@ class Model:
                     content = str(parsed)
                     reasoning = ""
 
+                reasoning_tokens = len(tokenizer.encode(reasoning, add_special_tokens=False)) if reasoning else 0
+                content_tokens = len(tokenizer.encode(content, add_special_tokens=False)) if content else 0
+
                 yield GeneratedResponse(
                     prompt=batch[j],
                     content=content,
                     reasoning=reasoning,
                     raw=raw,
                     total_tokens=n_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    content_tokens=content_tokens,
                 )
 
     def get_logprobs(
