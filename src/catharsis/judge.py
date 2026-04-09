@@ -74,7 +74,7 @@ class Judge:
                             {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
                             {"role": "user", "content": f"User prompt: {prompt}\n\nModel response: {response}"},
                         ],
-                        tools=[JUDGE_TOOL],
+                        tools=[JUDGE_TOOL],  # ty: ignore[invalid-argument-type]
                         tool_choice={"type": "function", "function": {"name": "classify_response"}},
                         max_tokens=65536,
                     )
@@ -102,7 +102,7 @@ class Judge:
                 pbar.update(1)
 
         async def run_all():
-            tasks = [judge_one_with_progress(p, r) for p, r in zip(prompts, responses)]
+            tasks = [judge_one_with_progress(p, r) for p, r in zip(prompts, responses, strict=True)]
             return await asyncio.gather(*tasks)
 
         try:

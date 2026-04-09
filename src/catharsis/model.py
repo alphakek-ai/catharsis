@@ -1,6 +1,7 @@
 """Model loading, LoRA perturbation, and generation."""
 
 import re
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -24,7 +25,7 @@ class Model:
         self.model_name = model_name
         self.lora_rank = lora_rank
 
-        self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = cast(PreTrainedTokenizerBase, AutoTokenizer.from_pretrained(model_name))
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
@@ -37,7 +38,12 @@ class Model:
         # Detect architecture and configure LoRA targets
         self.arch: ArchConfig = detect_arch(self.base_model.config)
         self.lora_targets = lora_targets or self.arch.default_lora_targets
-        log.info("arch_detected", model_type=getattr(self.base_model.config, "model_type", "unknown"), layers_path=self.arch.layers_path, lora_targets=self.lora_targets)
+        log.info(
+            "arch_detected",
+            model_type=getattr(self.base_model.config, "model_type", "unknown"),
+            layers_path=self.arch.layers_path,
+            lora_targets=self.lora_targets,
+        )
 
         # Scope LoRA to the transformer layers path to avoid unsupported
         # module types in vision/audio towers (e.g. Gemma4ClippableLinear).
@@ -52,7 +58,7 @@ class Model:
             bias="none",
             task_type="CAUSAL_LM",
         )
-        self.model: PeftModel = get_peft_model(self.base_model, self.peft_config)
+        self.model = cast(PeftModel, get_peft_model(self.base_model, self.peft_config))
 
     @property
     def device(self) -> torch.device:

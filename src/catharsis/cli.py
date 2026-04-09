@@ -50,7 +50,7 @@ def run(
     log.info("base_logprobs_ready")
 
     log.info("starting_evolution", population_size=population_size, generations=generations, noise_std=noise_std)
-    best_params = evolve(
+    evolve(
         model=m,
         judge=judge,
         good_prompts=good_eval,
