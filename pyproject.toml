@@ -1,0 +1,46 @@
+[project]
+name = "catharsis"
+version = "0.1.0"
+description = "LLM re-alignment toolkit"
+readme = "README.md"
+authors = [
+    { name = "Vladimir Sotnikov", email = "vladimir.s@alphakek.ai" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "torch>=2.10",
+    "transformers>=5.4",
+    "peft>=0.18",
+    "datasets>=4.8",
+    "openai>=2.24",
+    "pydantic>=2.12",
+    "tqdm>=4.67",
+]
+
+[project.scripts]
+catharsis = "catharsis.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.9.30,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["ruff>=0.14", "ty>=0.0.5", "pytest>=9.0"]
+
+[tool.uv]
+exclude-newer = "7 days"
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "B", "I"]
+ignore = ["E501"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.ty]
+python-version = "3.13"
