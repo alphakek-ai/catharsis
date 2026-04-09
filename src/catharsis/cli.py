@@ -68,7 +68,7 @@ def run(
     log.info("saving_model", output_dir=out)
     merged = m.model.merge_and_unload()
     merged.save_pretrained(out, safe_serialization=True)
-    m.tokenizer.save_pretrained(out)
+    m.processor.save_pretrained(out)
     log.info("done", output_dir=out)
 
 

@@ -1,16 +1,27 @@
 """Model loading, LoRA perturbation, and generation."""
 
 import re
+from dataclasses import dataclass
 from typing import cast
 
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch import Tensor
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
+from transformers import AutoModelForCausalLM, AutoProcessor, PreTrainedModel
 
 from .arch import ArchConfig, detect_arch
 from .log import log
+
+
+@dataclass
+class GeneratedResponse:
+    """A single generated response with reasoning/content split."""
+
+    prompt: str
+    content: str  # The actual answer (post-thinking)
+    reasoning: str  # The thinking trace (if any)
+    raw: str  # Full raw output with special tokens
 
 
 class Model:
@@ -21,14 +32,16 @@ class Model:
         lora_targets: list[str] | None = None,
         dtype: str = "auto",
         device_map: str = "auto",
+        enable_thinking: bool = False,
     ):
         self.model_name = model_name
         self.lora_rank = lora_rank
+        self.enable_thinking = enable_thinking
 
-        self.tokenizer = cast(PreTrainedTokenizerBase, AutoTokenizer.from_pretrained(model_name))
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.padding_side = "left"
+        self.processor = AutoProcessor.from_pretrained(model_name)
+        if self.processor.tokenizer.pad_token is None:
+            self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
+        self.processor.tokenizer.padding_side = "left"
 
         self.base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
             model_name, dtype=dtype, device_map=device_map
@@ -95,10 +108,8 @@ class Model:
         max_new_tokens: int = 1000,
         batch_size: int = 32,
     ) -> list[str]:
-        """Generate responses for a list of prompts (clean text only)."""
-        return [
-            clean for _, clean, _raw in self.generate_responses_iter(prompts, system_prompt, max_new_tokens, batch_size)
-        ]
+        """Generate responses for a list of prompts (content text only)."""
+        return [r.content for r in self.generate_responses_iter(prompts, system_prompt, max_new_tokens, batch_size)]
 
     def generate_responses_iter(
         self,
@@ -107,26 +118,45 @@ class Model:
         max_new_tokens: int = 1000,
         batch_size: int = 32,
     ):
-        """Yield (prompt, response) pairs as each batch completes."""
+        """Yield GeneratedResponse objects as each batch completes."""
         for i in range(0, len(prompts), batch_size):
             batch = prompts[i : i + batch_size]
             chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in batch]
-            chat_texts = self.tokenizer.apply_chat_template(chats, add_generation_prompt=True, tokenize=False)
-            inputs = self.tokenizer(chat_texts, return_tensors="pt", padding=True, return_token_type_ids=False).to(
-                self.device
+            texts = self.processor.apply_chat_template(
+                chats,
+                add_generation_prompt=True,
+                tokenize=False,
+                enable_thinking=self.enable_thinking,
             )
+            inputs = self.processor(text=texts, return_tensors="pt", padding=True).to(self.device)
+            input_len = inputs["input_ids"].shape[-1]
+
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
-                    pad_token_id=self.tokenizer.pad_token_id,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
                 )
+
             for j, output in enumerate(outputs):
-                generated_ids = output[inputs["input_ids"].shape[1] :]
-                raw = self.tokenizer.decode(generated_ids, skip_special_tokens=False)
-                clean = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
-                yield batch[j], clean, raw
+                raw = self.processor.decode(output[input_len:], skip_special_tokens=False)
+
+                # Use processor.parse_response to split thinking from content
+                parsed = self.processor.parse_response(raw)
+                if isinstance(parsed, dict):
+                    content = parsed.get("content", raw)
+                    reasoning = parsed.get("thinking", "")
+                else:
+                    content = str(parsed)
+                    reasoning = ""
+
+                yield GeneratedResponse(
+                    prompt=batch[j],
+                    content=content,
+                    reasoning=reasoning,
+                    raw=raw,
+                )
 
     def get_logprobs(
         self,
@@ -139,17 +169,21 @@ class Model:
         for i in range(0, len(prompts), batch_size):
             batch = prompts[i : i + batch_size]
             chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in batch]
-            chat_texts = self.tokenizer.apply_chat_template(chats, add_generation_prompt=True, tokenize=False)
-            inputs = self.tokenizer(chat_texts, return_tensors="pt", padding=True, return_token_type_ids=False).to(
-                self.device
+            texts = self.processor.apply_chat_template(
+                chats,
+                add_generation_prompt=True,
+                tokenize=False,
+                enable_thinking=self.enable_thinking,
             )
+            inputs = self.processor(text=texts, return_tensors="pt", padding=True).to(self.device)
+
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
                     max_new_tokens=1,
                     output_scores=True,
                     return_dict_in_generate=True,
-                    pad_token_id=self.tokenizer.pad_token_id,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
                     do_sample=False,
                 )
             logits = outputs.scores[0]

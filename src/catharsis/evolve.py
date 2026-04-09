@@ -9,7 +9,7 @@ from tqdm import tqdm
 from .judge import Judge
 from .log import log
 from .model import Model
-from .trace import TraceWriter, measure_response
+from .trace import ResponseLengths, TraceWriter
 
 
 def _fmt(seconds: float) -> str:
@@ -91,29 +91,31 @@ def evolve(
             )
             t_gen = time.perf_counter() - t0
 
-            clean_responses = [clean for _, clean, _raw in gen_results]
-
-            # Write responses to trace immediately (raw includes reasoning tokens)
+            # Write responses to trace immediately
             response_lengths = []
-            for prompt_idx, (_prompt, clean, raw) in enumerate(gen_results):
-                rl = measure_response(raw)
+            for prompt_idx, resp in enumerate(gen_results):
+                rl = ResponseLengths(
+                    reasoning=len(resp.reasoning),
+                    content=len(resp.content),
+                    total=len(resp.raw),
+                )
                 response_lengths.append(rl)
                 trace.write_response(
                     generation=gen + 1,
                     candidate=cand_idx + 1,
                     prompt_idx=prompt_idx,
-                    prompt=bad_prompts[prompt_idx],
-                    response=clean,
+                    prompt=resp.prompt,
+                    response=resp.content,
                     response_lengths=rl,
-                    raw_response=raw,
+                    raw_response=resp.raw if resp.reasoning else None,
                 )
 
             t0 = time.perf_counter()
             kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
             t_kl = time.perf_counter() - t0
 
-            # Fire judge calls with clean text (non-blocking)
-            tasks = [judge.submit(p, r) for p, r in zip(bad_prompts, clean_responses, strict=True)]
+            # Fire judge calls with content text (non-blocking)
+            tasks = [judge.submit(p, r.content) for p, r in zip(bad_prompts, gen_results, strict=True)]
             all_judge_tasks.append(tasks)
 
             content_lens = sorted(rl.content for rl in response_lengths)
