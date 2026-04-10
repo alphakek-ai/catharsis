@@ -43,9 +43,11 @@ class Model:
         self.enable_thinking = enable_thinking
 
         self.processor = AutoProcessor.from_pretrained(model_name)
-        if self.processor.tokenizer.pad_token is None:
-            self.processor.tokenizer.pad_token = self.processor.tokenizer.eos_token
-        self.processor.tokenizer.padding_side = "left"
+        # AutoProcessor returns either a Processor (with .tokenizer) or a Tokenizer directly
+        self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "left"
 
         self.base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
             model_name,
@@ -180,13 +182,13 @@ class Model:
                         **inputs,
                         max_new_tokens=max_new_tokens,
                         do_sample=False,
-                        pad_token_id=self.processor.tokenizer.pad_token_id,
+                        pad_token_id=self.tokenizer.pad_token_id,
                     )
         finally:
             self.model.enable_adapter_layers()
 
         # Parse outputs back to per-candidate results
-        tokenizer = self.processor.tokenizer
+        tokenizer = self.tokenizer
         pad_id = tokenizer.pad_token_id
         results: dict[int, list[GeneratedResponse]] = {i: [] for i in range(n_candidates)}
 
@@ -211,20 +213,27 @@ class Model:
             tokenize=False,
             enable_thinking=self.enable_thinking,
         )
-        return [self.processor.tokenizer.encode(t) for t in texts]
+        return [self.tokenizer.encode(t) for t in texts]
 
     def _parse_output(self, prompt: str, generated_tokens: list[int]) -> GeneratedResponse:
         """Parse generated token IDs into a GeneratedResponse."""
-        tokenizer = self.processor.tokenizer
+        tokenizer = self.tokenizer
         raw = tokenizer.decode(generated_tokens, skip_special_tokens=False)
 
-        parsed = self.processor.parse_response(raw)
-        if isinstance(parsed, dict):
-            content = parsed.get("content", raw)
-            reasoning = parsed.get("thinking", "")
-        else:
-            content = str(parsed)
-            reasoning = ""
+        # Use parse_response if available (Gemma4 processor), fall back to clean decode
+        content = raw
+        reasoning = ""
+        if hasattr(self.processor, "parse_response") and hasattr(self.processor, "response_schema"):
+            try:
+                parsed = self.processor.parse_response(raw)
+                if isinstance(parsed, dict):
+                    content = parsed.get("content", raw)
+                    reasoning = parsed.get("thinking", "")
+            except (AttributeError, Exception):
+                pass
+        if content == raw:
+            # Fall back: strip special tokens for content
+            content = tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
         reasoning_tokens = len(tokenizer.encode(reasoning, add_special_tokens=False)) if reasoning else 0
         content_tokens = len(tokenizer.encode(content, add_special_tokens=False)) if content else 0
@@ -265,10 +274,10 @@ class Model:
                     **inputs,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
-                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id,
                 )
 
-            tokenizer = self.processor.tokenizer
+            tokenizer = self.tokenizer
             pad_id = tokenizer.pad_token_id
             for j, output in enumerate(outputs):
                 generated_ids = output[input_len:]
@@ -306,10 +315,10 @@ class Model:
                     **inputs,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
-                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id,
                 )
 
-            tokenizer = self.processor.tokenizer
+            tokenizer = self.tokenizer
             pad_id = tokenizer.pad_token_id
             for j, output in enumerate(outputs):
                 generated_ids = output[input_len:]
@@ -342,7 +351,7 @@ class Model:
                     max_new_tokens=1,
                     output_scores=True,
                     return_dict_in_generate=True,
-                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                    pad_token_id=self.tokenizer.pad_token_id,
                     do_sample=False,
                 )
             logits = outputs.scores[0]
