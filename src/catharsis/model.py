@@ -1,4 +1,4 @@
-"""Model loading, LoRA perturbation, and generation with continuous batching."""
+"""Model loading, LoRA perturbation, and generation."""
 
 import re
 from dataclasses import dataclass
@@ -8,8 +8,7 @@ import torch
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch import Tensor
-from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig, PreTrainedModel
-from transformers.generation import ContinuousBatchingConfig
+from transformers import AutoModelForCausalLM, AutoProcessor, PreTrainedModel
 
 from .arch import ArchConfig, detect_arch
 from .log import log
@@ -78,20 +77,6 @@ class Model:
             task_type="CAUSAL_LM",
         )
         self.model = cast(PeftModel, get_peft_model(self.base_model, self.peft_config))
-
-        # Generation config
-        self.generation_config = GenerationConfig(
-            max_new_tokens=2000,
-            do_sample=False,
-            eos_token_id=self.processor.tokenizer.eos_token_id,
-            pad_token_id=self.processor.tokenizer.pad_token_id,
-        )
-
-        # Continuous batching config
-        self.cb_config = ContinuousBatchingConfig(
-            use_cuda_graph=True,
-            return_logprobs=False,
-        )
 
     @property
     def device(self) -> torch.device:
@@ -175,80 +160,78 @@ class Model:
         prompts: list[str],
         system_prompt: str = "You are a helpful assistant.",
         max_new_tokens: int = 2000,
+        batch_size: int = 32,
     ) -> list[GeneratedResponse]:
-        """Generate responses using continuous batching. Returns when all are done."""
-        inputs = self._tokenize_prompts(prompts, system_prompt)
-
-        gen_config = GenerationConfig(
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            eos_token_id=self.processor.tokenizer.eos_token_id,
-            pad_token_id=self.processor.tokenizer.pad_token_id,
-        )
-
-        with torch.no_grad():
-            outputs = self.model.generate_batch(
-                inputs=inputs,
-                generation_config=gen_config,
-                continuous_batching_config=self.cb_config,
-                progress_bar=False,
+        """Generate responses for a list of prompts."""
+        all_results = []
+        for i in range(0, len(prompts), batch_size):
+            batch = prompts[i : i + batch_size]
+            chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in batch]
+            texts = self.processor.apply_chat_template(
+                chats,
+                add_generation_prompt=True,
+                tokenize=False,
+                enable_thinking=self.enable_thinking,
             )
+            inputs = self.processor(text=texts, return_tensors="pt", padding=True).to(self.device)
+            input_len = inputs["input_ids"].shape[-1]
 
-        # Map results back to prompts (outputs keyed by request_id)
-        results = []
-        for i, prompt in enumerate(prompts):
-            request_id = str(i)
-            if request_id in outputs:
-                output = outputs[request_id]
-                results.append(self._parse_output(prompt, output.generated_tokens))
-            else:
-                # Fallback — shouldn't happen
-                results.append(
-                    GeneratedResponse(
-                        prompt=prompt,
-                        content="",
-                        reasoning="",
-                        raw="",
-                        total_tokens=0,
-                        reasoning_tokens=0,
-                        content_tokens=0,
-                    )
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
                 )
-        return results
+
+            tokenizer = self.processor.tokenizer
+            pad_id = tokenizer.pad_token_id
+            for j, output in enumerate(outputs):
+                generated_ids = output[input_len:]
+                if pad_id is not None:
+                    generated_ids = generated_ids[generated_ids != pad_id]
+                all_results.append(self._parse_output(batch[j], generated_ids.tolist()))
+        return all_results
 
     def generate_responses_streaming(
         self,
         prompts: list[str],
         system_prompt: str = "You are a helpful assistant.",
         max_new_tokens: int = 2000,
+        batch_size: int = 32,
     ):
-        """Generate responses with continuous batching, yielding each as it completes.
+        """Yield GeneratedResponse objects as each batch completes.
 
-        Short responses (e.g. refusals) finish first and are yielded immediately,
-        while long responses continue generating. No batch-level blocking.
+        TODO: Switch to continuous batching (generate_batch) once transformers
+        supports Gemma4's composite config in PagedAttentionCache.
         """
-        inputs = self._tokenize_prompts(prompts, system_prompt)
-        prompt_map = {}  # request_id -> prompt text
+        for i in range(0, len(prompts), batch_size):
+            batch = prompts[i : i + batch_size]
+            chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in batch]
+            texts = self.processor.apply_chat_template(
+                chats,
+                add_generation_prompt=True,
+                tokenize=False,
+                enable_thinking=self.enable_thinking,
+            )
+            inputs = self.processor(text=texts, return_tensors="pt", padding=True).to(self.device)
+            input_len = inputs["input_ids"].shape[-1]
 
-        gen_config = GenerationConfig(
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            eos_token_id=self.processor.tokenizer.eos_token_id,
-            pad_token_id=self.processor.tokenizer.pad_token_id,
-        )
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=self.processor.tokenizer.pad_token_id,
+                )
 
-        with self.model.continuous_batching_context_manager(
-            generation_config=gen_config,
-            continuous_batching_config=self.cb_config,
-        ) as manager:
-            for i, (prompt, input_ids) in enumerate(zip(prompts, inputs, strict=True)):
-                request_id = str(i)
-                prompt_map[request_id] = prompt
-                manager.add_request(input_ids=input_ids, request_id=request_id)
-
-            for result in manager:
-                prompt = prompt_map[result.request_id]
-                yield self._parse_output(prompt, result.generated_tokens)
+            tokenizer = self.processor.tokenizer
+            pad_id = tokenizer.pad_token_id
+            for j, output in enumerate(outputs):
+                generated_ids = output[input_len:]
+                if pad_id is not None:
+                    generated_ids = generated_ids[generated_ids != pad_id]
+                yield self._parse_output(batch[j], generated_ids.tolist())
 
     def get_logprobs(
         self,
