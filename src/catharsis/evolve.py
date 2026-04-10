@@ -93,97 +93,114 @@ def evolve(
         for _ in range(n_pairs):
             noise_vectors.append(torch.randn(n_params, device=device))
 
+        # Build all candidate param vectors (antithetic pairs)
+        candidate_params = []
+        candidate_labels = []  # (sign_label, pair_idx)
+        for pair_idx, noise in enumerate(noise_vectors):
+            candidate_params.append(params + noise_std * noise)
+            candidate_labels.append(("+", pair_idx))
+            candidate_params.append(params - noise_std * noise)
+            candidate_labels.append(("-", pair_idx))
+
+        # Generate ALL candidates in ONE forward pass
+        t0 = time.perf_counter()
+        all_results = model.generate_batched_candidates(step_prompts, candidate_params, max_new_tokens=max_new_tokens)
+        t_gen = time.perf_counter() - t0
+        pbar.update(len(candidate_params) * len(step_prompts))  # generation steps
+
+        log.info(
+            "batched_generation_done",
+            n_candidates=len(candidate_params),
+            n_prompts=len(step_prompts),
+            t_gen=f"{t_gen:.1f}s",
+        )
+
+        # Score each candidate: write traces, fire judge calls, compute KL
         scores_plus = []
         scores_minus = []
 
-        for pair_idx, noise in enumerate(noise_vectors):
-            for sign, sign_label, score_list in [(1.0, "+", scores_plus), (-1.0, "-", scores_minus)]:
-                model.set_lora_from_flat(params + sign * noise_std * noise)
-                cand_idx = pair_idx * 2 + (1 if sign > 0 else 2)
+        all_judge_tasks = []
+        for cand_idx, (sign_label, pair_idx) in enumerate(candidate_labels):
+            gen_results = all_results[cand_idx]
 
-                # Generate with continuous batching — streams results as they complete
-                t0 = time.perf_counter()
-                gen_results = []
-                response_lengths = []
-
-                for resp in model.generate_responses_streaming(step_prompts, max_new_tokens=max_new_tokens):
-                    gen_results.append(resp)
-                    pbar.update(1)
-
-                    rl = ResponseLengths(
-                        reasoning_tokens=resp.reasoning_tokens,
-                        content_tokens=resp.content_tokens,
-                        total_tokens=resp.total_tokens,
-                    )
-                    response_lengths.append(rl)
-
-                    prompt_idx = len(gen_results) - 1
-                    trace.write_response(
-                        generation=gen + 1,
-                        candidate=cand_idx,
-                        prompt_idx=prompt_idx,
-                        prompt=resp.prompt,
-                        response=resp.content,
-                        response_lengths=rl,
-                        raw_response=resp.raw if resp.raw != resp.content else None,
-                    )
-                t_gen = time.perf_counter() - t0
-
-                # KL
-                t0 = time.perf_counter()
-                kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
-                t_kl = time.perf_counter() - t0
-
-                # Judge — fire all at once, await
-                tasks = [judge.submit(p, r.content) for p, r in zip(step_prompts, gen_results, strict=True)]
-                judge.run_pending()
-                results = judge.await_all(tasks, pbar=pbar)
-
-                for prompt_idx, r in enumerate(results):
-                    trace.write_verdict(
-                        generation=gen + 1,
-                        candidate=cand_idx,
-                        prompt_idx=prompt_idx,
-                        is_refusal=r.is_refusal,
-                        judge_lengths=r.lengths,
-                        judge_error=r.error,
-                    )
-
-                refusals = sum(1 for r in results if r.is_refusal is True or r.is_refusal is None)
-                compliance_rate = 1.0 - (refusals / len(step_prompts))
-                score = compliance_rate - kl_weight * kl
-                score_list.append(score)
-
-                total_tok = sorted(rl.total_tokens for rl in response_lengths)
-                reasoning_tok = sorted(rl.reasoning_tokens for rl in response_lengths)
-
-                judge_reasoning_tok = sorted(r.lengths.reasoning_tokens for r in results if r.lengths is not None)
-                judge_total_tok = sorted(r.lengths.total_tokens for r in results if r.lengths is not None)
-                n_errors = sum(1 for r in results if r.error is not None)
-
-                log.info(
-                    "candidate_eval",
+            # Write traces
+            for prompt_idx, resp in enumerate(gen_results):
+                rl = ResponseLengths(
+                    reasoning_tokens=resp.reasoning_tokens,
+                    content_tokens=resp.content_tokens,
+                    total_tokens=resp.total_tokens,
+                )
+                trace.write_response(
                     generation=gen + 1,
-                    candidate=f"{sign_label}{pair_idx + 1}",
-                    compliance=round(compliance_rate * 100),
-                    refusals=refusals,
-                    judge_errors=n_errors,
-                    kl=round(kl, 4),
-                    score=round(score, 4),
-                    student_tok_p50=total_tok[len(total_tok) // 2] if total_tok else 0,
-                    student_tok_max=total_tok[-1] if total_tok else 0,
-                    student_reasoning_p50=reasoning_tok[len(reasoning_tok) // 2] if reasoning_tok else 0,
-                    judge_reasoning_p50=judge_reasoning_tok[len(judge_reasoning_tok) // 2]
-                    if judge_reasoning_tok
-                    else 0,
-                    judge_tok_max=judge_total_tok[-1] if judge_total_tok else 0,
-                    t_gen=f"{t_gen:.1f}s",
-                    t_kl=f"{t_kl:.1f}s",
+                    candidate=cand_idx + 1,
+                    prompt_idx=prompt_idx,
+                    prompt=resp.prompt,
+                    response=resp.content,
+                    response_lengths=rl,
+                    raw_response=resp.raw if resp.raw != resp.content else None,
                 )
 
-                for r in results:
-                    if r.error is not None:
-                        log.warning("judge_error", gen=gen + 1, cand=cand_idx, error=r.error)
+            # Fire judge calls (non-blocking)
+            tasks = [judge.submit(p, r.content) for p, r in zip(step_prompts, gen_results, strict=True)]
+            all_judge_tasks.append((cand_idx, sign_label, pair_idx, gen_results, tasks))
+
+        # Compute KL per candidate (requires loading adapter)
+        candidate_kls = []
+        for cand_idx in range(len(candidate_params)):
+            model.set_lora_from_flat(candidate_params[cand_idx])
+            kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
+            candidate_kls.append(kl)
+
+        # Await all judge results
+        for cand_idx, sign_label, pair_idx, gen_results, tasks in all_judge_tasks:
+            judge.run_pending()
+            results = judge.await_all(tasks, pbar=pbar)
+
+            for prompt_idx, r in enumerate(results):
+                trace.write_verdict(
+                    generation=gen + 1,
+                    candidate=cand_idx + 1,
+                    prompt_idx=prompt_idx,
+                    is_refusal=r.is_refusal,
+                    judge_lengths=r.lengths,
+                    judge_error=r.error,
+                )
+
+            refusals = sum(1 for r in results if r.is_refusal is True or r.is_refusal is None)
+            compliance_rate = 1.0 - (refusals / len(step_prompts))
+            kl = candidate_kls[cand_idx]
+            score = compliance_rate - kl_weight * kl
+
+            if sign_label == "+":
+                scores_plus.append(score)
+            else:
+                scores_minus.append(score)
+
+            total_tok = sorted(r.total_tokens for r in gen_results)
+            reasoning_tok = sorted(r.reasoning_tokens for r in gen_results)
+            judge_reasoning_tok = sorted(r.lengths.reasoning_tokens for r in results if r.lengths is not None)
+            judge_total_tok = sorted(r.lengths.total_tokens for r in results if r.lengths is not None)
+            n_errors = sum(1 for r in results if r.error is not None)
+
+            log.info(
+                "candidate_eval",
+                generation=gen + 1,
+                candidate=f"{sign_label}{pair_idx + 1}",
+                compliance=round(compliance_rate * 100),
+                refusals=refusals,
+                judge_errors=n_errors,
+                kl=round(kl, 4),
+                score=round(score, 4),
+                student_tok_p50=total_tok[len(total_tok) // 2] if total_tok else 0,
+                student_tok_max=total_tok[-1] if total_tok else 0,
+                student_reasoning_p50=reasoning_tok[len(reasoning_tok) // 2] if reasoning_tok else 0,
+                judge_reasoning_p50=judge_reasoning_tok[len(judge_reasoning_tok) // 2] if judge_reasoning_tok else 0,
+                judge_tok_max=judge_total_tok[-1] if judge_total_tok else 0,
+            )
+
+            for r in results:
+                if r.error is not None:
+                    log.warning("judge_error", gen=gen + 1, cand=cand_idx + 1, error=r.error)
 
         # Compute ES gradient
         grad = torch.zeros(n_params, device=device)

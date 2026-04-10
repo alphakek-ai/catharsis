@@ -11,6 +11,7 @@ from torch import Tensor
 from transformers import AutoModelForCausalLM, AutoProcessor, PreTrainedModel
 
 from .arch import ArchConfig, detect_arch
+from .batched_lora import BatchedLoRAContext, build_module_lora_params
 from .log import log
 
 
@@ -115,6 +116,89 @@ class Model:
 
     def lora_param_count(self) -> int:
         return sum(p.numel() for p in self.get_lora_params())
+
+    def get_lora_param_shapes(self) -> list[tuple[int, ...]]:
+        """Get shapes of all LoRA params (for batched generation)."""
+        return [tuple(p.shape) for p in self.get_lora_params()]
+
+    def generate_batched_candidates(
+        self,
+        prompts: list[str],
+        candidate_params: list[Tensor],
+        system_prompt: str = "You are a helpful assistant.",
+        max_new_tokens: int = 2000,
+    ) -> dict[int, list[GeneratedResponse]]:
+        """Generate responses for ALL candidates in a single forward pass.
+
+        Each candidate's LoRA perturbation is applied per-sample via hooks,
+        so the base weights are shared and the GPU processes everything at once.
+
+        Args:
+            prompts: List of prompts (same for all candidates).
+            candidate_params: List of flat LoRA param vectors, one per candidate.
+
+        Returns:
+            Dict mapping candidate index -> list of GeneratedResponse.
+        """
+        n_candidates = len(candidate_params)
+        n_prompts = len(prompts)
+
+        # Build per-module stacked LoRA params
+        lora_names, _ = self.get_lora_named_params()
+        lora_shapes = self.get_lora_param_shapes()
+        module_lora_params = build_module_lora_params(
+            self.model,
+            candidate_params,
+            lora_names,
+            lora_shapes,
+            self.device,
+        )
+
+        # Tokenize — same prompts repeated for each candidate
+        chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in prompts]
+        texts = self.processor.apply_chat_template(
+            chats,
+            add_generation_prompt=True,
+            tokenize=False,
+            enable_thinking=self.enable_thinking,
+        )
+        # Repeat for each candidate: [p0_c0, p1_c0, ..., p0_c1, p1_c1, ...]
+        all_texts = texts * n_candidates
+        inputs = self.processor(text=all_texts, return_tensors="pt", padding=True).to(self.device)
+        input_len = inputs["input_ids"].shape[-1]
+
+        # Map each sample to its candidate
+        candidate_ids = torch.repeat_interleave(torch.arange(n_candidates, device=self.device), n_prompts)
+
+        # Disable peft adapter, apply batched hooks instead
+        self.model.disable_adapter_layers()
+
+        try:
+            with BatchedLoRAContext(self.model, module_lora_params, candidate_ids):
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=self.processor.tokenizer.pad_token_id,
+                    )
+        finally:
+            self.model.enable_adapter_layers()
+
+        # Parse outputs back to per-candidate results
+        tokenizer = self.processor.tokenizer
+        pad_id = tokenizer.pad_token_id
+        results: dict[int, list[GeneratedResponse]] = {i: [] for i in range(n_candidates)}
+
+        for idx, output in enumerate(outputs):
+            cand_idx = idx // n_prompts
+            prompt_idx = idx % n_prompts
+            generated_ids = output[input_len:]
+            if pad_id is not None:
+                generated_ids = generated_ids[generated_ids != pad_id]
+            results[cand_idx].append(self._parse_output(prompts[prompt_idx], generated_ids.tolist()))
+
+        return results
 
     def _tokenize_prompts(
         self, prompts: list[str], system_prompt: str = "You are a helpful assistant."
