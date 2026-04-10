@@ -68,9 +68,9 @@ class BatchedLoRAContext:
             x = inputs[0]  # (batch, seq_len, d_in)
             batch_size = x.shape[0]
 
-            # Look up LoRA params for each sample's candidate
-            a = A[candidate_ids[:batch_size]]  # (batch, rank, d_in)
-            b = B[candidate_ids[:batch_size]]  # (batch, d_out, rank)
+            # Look up LoRA params for each sample's candidate, cast to match input dtype
+            a = A[candidate_ids[:batch_size]].to(x.dtype)  # (batch, rank, d_in)
+            b = B[candidate_ids[:batch_size]].to(x.dtype)  # (batch, d_out, rank)
 
             # Compute correction: x @ A.T @ B.T
             # x: (batch, seq, d_in), a.T: (batch, d_in, rank) -> proj: (batch, seq, rank)
