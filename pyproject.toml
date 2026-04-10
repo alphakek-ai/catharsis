@@ -19,6 +19,8 @@ dependencies = [
     "structlog>=25.1",
     "pillow>=12.2.0",
     "torchvision>=0.26.0",
+    "safetensors>=0.7.0",
+    "httpx>=0.28.1",
 ]
 
 [project.scripts]

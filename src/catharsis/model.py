@@ -84,6 +84,16 @@ class Model:
         """Get all LoRA A and B weight tensors."""
         return [p for _, p in self.model.named_parameters() if "lora_" in _ and p.requires_grad]
 
+    def get_lora_named_params(self) -> tuple[list[str], list[Tensor]]:
+        """Get LoRA param names and tensors (for saving adapters)."""
+        names = []
+        params = []
+        for name, p in self.model.named_parameters():
+            if "lora_" in name and p.requires_grad:
+                names.append(name)
+                params.append(p)
+        return names, params
+
     def zero_lora(self):
         """Reset all LoRA weights to zero (identity)."""
         for param in self.get_lora_params():
