@@ -23,6 +23,7 @@ def run(
     batch_size: Annotated[int, typer.Option(help="Inference batch size")] = 32,
     max_new_tokens: Annotated[int, typer.Option(help="Max tokens per response")] = 2000,
     prompts_per_step: Annotated[int, typer.Option(help="Bad prompts sampled per generation step")] = 10,
+    max_batch_sequences: Annotated[int, typer.Option(help="Max sequences per generation sub-batch")] = 64,
     output_dir: Annotated[Optional[str], typer.Option(help="Output directory")] = None,
 ):
     """Run evolutionary LoRA search with LLM judge fitness."""
@@ -72,6 +73,7 @@ def run(
         batch_size=batch_size,
         max_new_tokens=max_new_tokens,
         prompts_per_step=prompts_per_step,
+        max_batch_sequences=max_batch_sequences,
     )
 
     out = output_dir or f"{model.replace('/', '--')}-catharsis"

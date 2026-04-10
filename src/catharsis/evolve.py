@@ -36,6 +36,7 @@ def evolve(
     batch_size: int = 32,
     max_new_tokens: int = 2000,
     prompts_per_step: int | None = None,
+    max_batch_sequences: int = 64,
 ) -> Tensor:
     """
     Evolution strategies with antithetic sampling over LoRA parameters.
@@ -104,7 +105,9 @@ def evolve(
 
         # Generate ALL candidates in ONE forward pass
         t0 = time.perf_counter()
-        all_results = model.generate_batched_candidates(step_prompts, candidate_params, max_new_tokens=max_new_tokens)
+        all_results = model.generate_batched_candidates(
+            step_prompts, candidate_params, max_new_tokens=max_new_tokens, max_batch_sequences=max_batch_sequences
+        )
         t_gen = time.perf_counter() - t0
         pbar.update(len(candidate_params) * len(step_prompts))  # generation steps
 

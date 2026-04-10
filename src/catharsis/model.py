@@ -129,15 +129,18 @@ class Model:
         candidate_params: list[Tensor],
         system_prompt: str = "You are a helpful assistant.",
         max_new_tokens: int = 2000,
+        max_batch_sequences: int = 64,
     ) -> dict[int, list[GeneratedResponse]]:
-        """Generate responses for ALL candidates in a single forward pass.
+        """Generate responses for ALL candidates, sub-batched to fit in VRAM.
 
         Each candidate's LoRA perturbation is applied per-sample via hooks,
-        so the base weights are shared and the GPU processes everything at once.
+        so the base weights are shared. Sub-batches process multiple candidates
+        simultaneously while staying within memory limits.
 
         Args:
             prompts: List of prompts (same for all candidates).
             candidate_params: List of flat LoRA param vectors, one per candidate.
+            max_batch_sequences: Max sequences per sub-batch (controls VRAM usage).
 
         Returns:
             Dict mapping candidate index -> list of GeneratedResponse.
@@ -145,7 +148,7 @@ class Model:
         n_candidates = len(candidate_params)
         n_prompts = len(prompts)
 
-        # Build per-module stacked LoRA params
+        # Build per-module stacked LoRA params (all candidates)
         lora_names, _ = self.get_lora_named_params()
         lora_shapes = self.get_lora_param_shapes()
         module_lora_params = build_module_lora_params(
@@ -156,7 +159,7 @@ class Model:
             self.device,
         )
 
-        # Tokenize — same prompts repeated for each candidate
+        # Tokenize prompts once
         chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in prompts]
         texts = self.processor.apply_chat_template(
             chats,
@@ -164,41 +167,55 @@ class Model:
             tokenize=False,
             enable_thinking=self.enable_thinking,
         )
-        # Repeat for each candidate: [p0_c0, p1_c0, ..., p0_c1, p1_c1, ...]
-        all_texts = texts * n_candidates
-        inputs = self.processor(text=all_texts, return_tensors="pt", padding=True).to(self.device)
-        input_len = inputs["input_ids"].shape[-1]
 
-        # Map each sample to its candidate
-        candidate_ids = torch.repeat_interleave(torch.arange(n_candidates, device=self.device), n_prompts)
-
-        # Disable peft adapter, apply batched hooks instead
-        self.model.disable_adapter_layers()
-
-        try:
-            with BatchedLoRAContext(self.model, module_lora_params, candidate_ids):
-                with torch.no_grad():
-                    outputs = self.model.generate(
-                        **inputs,
-                        max_new_tokens=max_new_tokens,
-                        do_sample=False,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                    )
-        finally:
-            self.model.enable_adapter_layers()
-
-        # Parse outputs back to per-candidate results
+        results: dict[int, list[GeneratedResponse]] = {i: [] for i in range(n_candidates)}
         tokenizer = self.tokenizer
         pad_id = tokenizer.pad_token_id
-        results: dict[int, list[GeneratedResponse]] = {i: [] for i in range(n_candidates)}
 
-        for idx, output in enumerate(outputs):
-            cand_idx = idx // n_prompts
-            prompt_idx = idx % n_prompts
-            generated_ids = output[input_len:]
-            if pad_id is not None:
-                generated_ids = generated_ids[generated_ids != pad_id]
-            results[cand_idx].append(self._parse_output(prompts[prompt_idx], generated_ids.tolist()))
+        # How many candidates fit per sub-batch
+        cands_per_batch = max(1, max_batch_sequences // n_prompts)
+
+        # Process in sub-batches
+        for batch_start in range(0, n_candidates, cands_per_batch):
+            batch_end = min(batch_start + cands_per_batch, n_candidates)
+            batch_cand_indices = list(range(batch_start, batch_end))
+            batch_n_cands = len(batch_cand_indices)
+
+            # Build sub-batch texts: repeat prompts for each candidate in this sub-batch
+            batch_texts = texts * batch_n_cands
+            inputs = self.processor(text=batch_texts, return_tensors="pt", padding=True).to(self.device)
+            input_len = inputs["input_ids"].shape[-1]
+
+            # Map samples to candidate indices within the sub-batch module params
+            candidate_ids = torch.repeat_interleave(torch.arange(batch_start, batch_end, device=self.device), n_prompts)
+
+            self.model.disable_adapter_layers()
+            try:
+                with BatchedLoRAContext(self.model, module_lora_params, candidate_ids):
+                    with torch.no_grad():
+                        outputs = self.model.generate(
+                            **inputs,
+                            max_new_tokens=max_new_tokens,
+                            do_sample=False,
+                            pad_token_id=pad_id,
+                        )
+            finally:
+                self.model.enable_adapter_layers()
+
+            for idx, output in enumerate(outputs):
+                cand_offset = idx // n_prompts
+                prompt_idx = idx % n_prompts
+                cand_idx = batch_cand_indices[cand_offset]
+                generated_ids = output[input_len:]
+                if pad_id is not None:
+                    generated_ids = generated_ids[generated_ids != pad_id]
+                results[cand_idx].append(self._parse_output(prompts[prompt_idx], generated_ids.tolist()))
+
+            log.info(
+                "sub_batch_done",
+                candidates=f"{batch_start + 1}-{batch_end}/{n_candidates}",
+                sequences=batch_n_cands * n_prompts,
+            )
 
         return results
 
