@@ -157,17 +157,26 @@ def evolve(
                 total_tok = sorted(rl.total_tokens for rl in response_lengths)
                 reasoning_tok = sorted(rl.reasoning_tokens for rl in response_lengths)
 
+                judge_reasoning_tok = sorted(r.lengths.reasoning_tokens for r in results if r.lengths is not None)
+                judge_total_tok = sorted(r.lengths.total_tokens for r in results if r.lengths is not None)
+                n_errors = sum(1 for r in results if r.error is not None)
+
                 log.info(
                     "candidate_eval",
                     generation=gen + 1,
                     candidate=f"{sign_label}{pair_idx + 1}",
                     compliance=round(compliance_rate * 100),
                     refusals=refusals,
+                    judge_errors=n_errors,
                     kl=round(kl, 4),
                     score=round(score, 4),
-                    tok_p50=total_tok[len(total_tok) // 2] if total_tok else 0,
-                    tok_max=total_tok[-1] if total_tok else 0,
-                    reasoning_tok_p50=reasoning_tok[len(reasoning_tok) // 2] if reasoning_tok else 0,
+                    student_tok_p50=total_tok[len(total_tok) // 2] if total_tok else 0,
+                    student_tok_max=total_tok[-1] if total_tok else 0,
+                    student_reasoning_p50=reasoning_tok[len(reasoning_tok) // 2] if reasoning_tok else 0,
+                    judge_reasoning_p50=judge_reasoning_tok[len(judge_reasoning_tok) // 2]
+                    if judge_reasoning_tok
+                    else 0,
+                    judge_tok_max=judge_total_tok[-1] if judge_total_tok else 0,
                     t_gen=f"{t_gen:.1f}s",
                     t_kl=f"{t_kl:.1f}s",
                 )
