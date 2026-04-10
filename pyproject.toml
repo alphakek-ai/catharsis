@@ -9,8 +9,9 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "torch>=2.10",
-    "transformers @ git+https://github.com/huggingface/transformers.git",
-    "peft>=0.18",
+    "torchvision",
+    "transformers>=5.5.3",
+    "peft",
     "datasets>=4.8",
     "openai>=2.24",
     "pydantic>=2.12",
@@ -18,7 +19,6 @@ dependencies = [
     "typer>=0.24",
     "structlog>=25.1",
     "pillow>=12.2.0",
-    "torchvision",
     "safetensors>=0.7.0",
     "httpx>=0.28.1",
 ]
@@ -32,15 +32,28 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "ruff>=0.14",
-    "ty>=0.0.5",
+    "ruff>=0.15.0",
+    "ty>=0.0.25",
     "pytest>=9.0",
     "pre-commit>=4.5.1",
     "trl>=1.0.0",
 ]
 
-[tool.uv]
-exclude-newer = "7 days"
+#[tool.uv]
+#exclude-newer = "7 days"
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+torchvision = [
+    { index = "pytorch-cu128", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [tool.ruff]
 line-length = 120
