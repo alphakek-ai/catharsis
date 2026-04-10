@@ -18,7 +18,7 @@ dependencies = [
     "typer>=0.24",
     "structlog>=25.1",
     "pillow>=12.2.0",
-    "torchvision>=0.26.0",
+    "torchvision",
     "safetensors>=0.7.0",
     "httpx>=0.28.1",
 ]
@@ -36,6 +36,7 @@ dev = [
     "ty>=0.0.5",
     "pytest>=9.0",
     "pre-commit>=4.5.1",
+    "trl>=1.0.0",
 ]
 
 [tool.uv]
