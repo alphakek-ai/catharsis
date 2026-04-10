@@ -1,4 +1,4 @@
-"""Model loading, LoRA perturbation, and generation."""
+"""Model loading, LoRA perturbation, and generation with continuous batching."""
 
 import re
 from dataclasses import dataclass
@@ -8,7 +8,8 @@ import torch
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
 from torch import Tensor
-from transformers import AutoModelForCausalLM, AutoProcessor, PreTrainedModel
+from transformers import AutoModelForCausalLM, AutoProcessor, GenerationConfig, PreTrainedModel
+from transformers.generation import ContinuousBatchingConfig
 
 from .arch import ArchConfig, detect_arch
 from .log import log
@@ -47,7 +48,10 @@ class Model:
         self.processor.tokenizer.padding_side = "left"
 
         self.base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-            model_name, dtype=dtype, device_map=device_map
+            model_name,
+            dtype=dtype,
+            device_map=device_map,
+            attn_implementation="flash_attention_2",
         )
         self.base_model.eval()
 
@@ -75,6 +79,20 @@ class Model:
             task_type="CAUSAL_LM",
         )
         self.model = cast(PeftModel, get_peft_model(self.base_model, self.peft_config))
+
+        # Generation config
+        self.generation_config = GenerationConfig(
+            max_new_tokens=2000,
+            do_sample=False,
+            eos_token_id=self.processor.tokenizer.eos_token_id,
+            pad_token_id=self.processor.tokenizer.pad_token_id,
+        )
+
+        # Continuous batching config
+        self.cb_config = ContinuousBatchingConfig(
+            use_cuda_graph=True,
+            return_logprobs=False,
+        )
 
     @property
     def device(self) -> torch.device:
@@ -114,75 +132,124 @@ class Model:
     def lora_param_count(self) -> int:
         return sum(p.numel() for p in self.get_lora_params())
 
+    def _tokenize_prompts(
+        self, prompts: list[str], system_prompt: str = "You are a helpful assistant."
+    ) -> list[list[int]]:
+        """Tokenize prompts with chat template. Returns list of token ID lists."""
+        chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in prompts]
+        texts = self.processor.apply_chat_template(
+            chats,
+            add_generation_prompt=True,
+            tokenize=False,
+            enable_thinking=self.enable_thinking,
+        )
+        return [self.processor.tokenizer.encode(t) for t in texts]
+
+    def _parse_output(self, prompt: str, generated_tokens: list[int]) -> GeneratedResponse:
+        """Parse generated token IDs into a GeneratedResponse."""
+        tokenizer = self.processor.tokenizer
+        raw = tokenizer.decode(generated_tokens, skip_special_tokens=False)
+
+        parsed = self.processor.parse_response(raw)
+        if isinstance(parsed, dict):
+            content = parsed.get("content", raw)
+            reasoning = parsed.get("thinking", "")
+        else:
+            content = str(parsed)
+            reasoning = ""
+
+        reasoning_tokens = len(tokenizer.encode(reasoning, add_special_tokens=False)) if reasoning else 0
+        content_tokens = len(tokenizer.encode(content, add_special_tokens=False)) if content else 0
+
+        return GeneratedResponse(
+            prompt=prompt,
+            content=content,
+            reasoning=reasoning,
+            raw=raw,
+            total_tokens=len(generated_tokens),
+            reasoning_tokens=reasoning_tokens,
+            content_tokens=content_tokens,
+        )
+
     def generate_responses(
         self,
         prompts: list[str],
         system_prompt: str = "You are a helpful assistant.",
-        max_new_tokens: int = 1000,
-        batch_size: int = 32,
-    ) -> list[str]:
-        """Generate responses for a list of prompts (content text only)."""
-        return [r.content for r in self.generate_responses_iter(prompts, system_prompt, max_new_tokens, batch_size)]
+        max_new_tokens: int = 2000,
+    ) -> list[GeneratedResponse]:
+        """Generate responses using continuous batching. Returns when all are done."""
+        inputs = self._tokenize_prompts(prompts, system_prompt)
 
-    def generate_responses_iter(
+        gen_config = GenerationConfig(
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            eos_token_id=self.processor.tokenizer.eos_token_id,
+            pad_token_id=self.processor.tokenizer.pad_token_id,
+        )
+
+        with torch.no_grad():
+            outputs = self.model.generate_batch(
+                inputs=inputs,
+                generation_config=gen_config,
+                continuous_batching_config=self.cb_config,
+                progress_bar=False,
+            )
+
+        # Map results back to prompts (outputs keyed by request_id)
+        results = []
+        for i, prompt in enumerate(prompts):
+            request_id = str(i)
+            if request_id in outputs:
+                output = outputs[request_id]
+                results.append(self._parse_output(prompt, output.generated_tokens))
+            else:
+                # Fallback — shouldn't happen
+                results.append(
+                    GeneratedResponse(
+                        prompt=prompt,
+                        content="",
+                        reasoning="",
+                        raw="",
+                        total_tokens=0,
+                        reasoning_tokens=0,
+                        content_tokens=0,
+                    )
+                )
+        return results
+
+    def generate_responses_streaming(
         self,
         prompts: list[str],
         system_prompt: str = "You are a helpful assistant.",
-        max_new_tokens: int = 1000,
-        batch_size: int = 32,
+        max_new_tokens: int = 2000,
     ):
-        """Yield GeneratedResponse objects as each batch completes."""
-        for i in range(0, len(prompts), batch_size):
-            batch = prompts[i : i + batch_size]
-            chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in batch]
-            texts = self.processor.apply_chat_template(
-                chats,
-                add_generation_prompt=True,
-                tokenize=False,
-                enable_thinking=self.enable_thinking,
-            )
-            inputs = self.processor(text=texts, return_tensors="pt", padding=True).to(self.device)
-            input_len = inputs["input_ids"].shape[-1]
+        """Generate responses with continuous batching, yielding each as it completes.
 
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=self.processor.tokenizer.pad_token_id,
-                )
+        Short responses (e.g. refusals) finish first and are yielded immediately,
+        while long responses continue generating. No batch-level blocking.
+        """
+        inputs = self._tokenize_prompts(prompts, system_prompt)
+        prompt_map = {}  # request_id -> prompt text
 
-            tokenizer = self.processor.tokenizer
-            pad_id = tokenizer.pad_token_id
-            for j, output in enumerate(outputs):
-                generated_ids = output[input_len:]
-                # Strip padding tokens
-                if pad_id is not None:
-                    generated_ids = generated_ids[generated_ids != pad_id]
-                n_tokens = len(generated_ids)
-                raw = self.processor.decode(generated_ids, skip_special_tokens=False)
+        gen_config = GenerationConfig(
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            eos_token_id=self.processor.tokenizer.eos_token_id,
+            pad_token_id=self.processor.tokenizer.pad_token_id,
+        )
 
-                # Use processor.parse_response to split thinking from content
-                parsed = self.processor.parse_response(raw)
-                if isinstance(parsed, dict):
-                    content = parsed.get("content", raw)
-                    reasoning = parsed.get("thinking", "")
-                else:
-                    content = str(parsed)
-                    reasoning = ""
+        with self.model.continuous_batching_context_manager(
+            generation_config=gen_config,
+            continuous_batching_config=self.cb_config,
+        ) as manager:
+            for i, (prompt, input_ids) in enumerate(zip(prompts, inputs, strict=True)):
+                request_id = str(i)
+                prompt_map[request_id] = prompt
+                manager.add_request(input_ids=input_ids, request_id=request_id)
 
-                reasoning_tokens = len(tokenizer.encode(reasoning, add_special_tokens=False)) if reasoning else 0
-                content_tokens = len(tokenizer.encode(content, add_special_tokens=False)) if content else 0
-
-                yield GeneratedResponse(
-                    prompt=batch[j],
-                    content=content,
-                    reasoning=reasoning,
-                    raw=raw,
-                    total_tokens=n_tokens,
-                    reasoning_tokens=reasoning_tokens,
-                    content_tokens=content_tokens,
-                )
+            for result in manager:
+                prompt = prompt_map[result.request_id]
+                yield self._parse_output(prompt, result.generated_tokens)
 
     def get_logprobs(
         self,
