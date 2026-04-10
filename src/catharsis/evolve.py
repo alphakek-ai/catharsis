@@ -1,4 +1,13 @@
-"""Evolution strategies with antithetic sampling over LoRA perturbations."""
+"""Evolution strategies with antithetic sampling over LoRA perturbations.
+
+Pipeline per generation:
+1. For each sub-batch of candidates:
+   a. Generate responses (GPU, heavy)
+   b. Write traces + fire judge calls (immediate, per response)
+   c. Compute KL for these candidates (GPU, light — while judge runs in background)
+2. Await remaining judge results
+3. Compute scores + ES gradient
+"""
 
 import random
 import time
@@ -38,13 +47,6 @@ def evolve(
     prompts_per_step: int | None = None,
     max_batch_sequences: int = 64,
 ) -> Tensor:
-    """
-    Evolution strategies with antithetic sampling over LoRA parameters.
-
-    Uses transformers continuous batching for fast generation — short responses
-    (refusals) finish immediately and free up the batch while long responses
-    continue generating. Judge calls fire as each response completes.
-    """
     n_params = model.lora_param_count()
     device = model.device
     n_pairs = population_size // 2
@@ -62,7 +64,7 @@ def evolve(
         lora_rank=model.lora_rank,
         lora_targets=model.lora_targets,
         method="antithetic_es",
-        backend="continuous_batching",
+        backend="batched_lora",
         population_size=population_size,
         n_pairs=n_pairs,
         generations=generations,
@@ -73,11 +75,13 @@ def evolve(
         n_bad=len(bad_prompts),
         prompts_per_step=n_prompts,
         max_new_tokens=max_new_tokens,
+        max_batch_sequences=max_batch_sequences,
     )
     log.info("trace_dir", path=str(trace.base_dir))
 
-    # Total steps: each pair = 2 candidates, each candidate = n_prompts (generate + judge)
-    total_steps = generations * n_pairs * 2 * n_prompts * 2
+    n_candidates = n_pairs * 2  # antithetic pairs
+    # Steps: generation + judge per prompt, per candidate, per generation
+    total_steps = generations * n_candidates * n_prompts * 2
     pbar = tqdm(total=total_steps, desc="best=0%", unit="step")
 
     gen_start = time.perf_counter()
@@ -86,51 +90,56 @@ def evolve(
         gen_t0 = time.perf_counter()
         pbar.set_description(f"Gen {gen + 1}/{generations} | best={best_compliance}%")
 
-        # Sample mini-batch
+        # Sample mini-batch of prompts
         step_prompts = random.sample(bad_prompts, min(n_prompts, len(bad_prompts)))
+        prompt_texts = model.tokenize_prompts(step_prompts)
 
-        # Generate noise vectors
-        noise_vectors = []
-        for _ in range(n_pairs):
-            noise_vectors.append(torch.randn(n_params, device=device))
-
-        # Build all candidate param vectors (antithetic pairs)
-        candidate_params = []
-        candidate_labels = []  # (sign_label, pair_idx)
+        # Build antithetic candidate params
+        noise_vectors = [torch.randn(n_params, device=device) for _ in range(n_pairs)]
+        candidate_params: list[Tensor] = []
+        candidate_labels: list[tuple[str, int]] = []  # (sign, pair_idx)
         for pair_idx, noise in enumerate(noise_vectors):
             candidate_params.append(params + noise_std * noise)
             candidate_labels.append(("+", pair_idx))
             candidate_params.append(params - noise_std * noise)
             candidate_labels.append(("-", pair_idx))
 
-        # Generate ALL candidates in ONE forward pass
-        t0 = time.perf_counter()
-        all_results = model.generate_batched_candidates(
-            step_prompts,
-            candidate_params,
-            max_new_tokens=max_new_tokens,
-            max_batch_sequences=max_batch_sequences,
-            pbar=pbar,
-        )
-        t_gen = time.perf_counter() - t0
+        # Precompute module LoRA params (once for all sub-batches)
+        module_lora_params = model.prepare_batched_lora(candidate_params)
 
-        log.info(
-            "batched_generation_done",
-            n_candidates=len(candidate_params),
-            n_prompts=len(step_prompts),
-            t_gen=f"{t_gen:.1f}s",
-        )
+        # How many candidates per sub-batch
+        cands_per_sub_batch = max(1, max_batch_sequences // n_prompts)
 
-        # Score each candidate: write traces, fire judge calls, compute KL
-        scores_plus = []
-        scores_minus = []
+        # Storage for results
+        candidate_responses: dict[int, list] = {i: [] for i in range(n_candidates)}
+        candidate_judge_tasks: dict[int, list] = {i: [] for i in range(n_candidates)}
+        candidate_kls: dict[int, float] = {}
 
-        all_judge_tasks = []
-        for cand_idx, (sign_label, pair_idx) in enumerate(candidate_labels):
-            gen_results = all_results[cand_idx]
+        # --- Pipeline: generate sub-batch → trace + judge → KL ---
+        for batch_start in range(0, n_candidates, cands_per_sub_batch):
+            batch_end = min(batch_start + cands_per_sub_batch, n_candidates)
+            batch_cand_indices = list(range(batch_start, batch_end))
+            batch_n = len(batch_cand_indices)
 
-            # Write traces
-            for prompt_idx, resp in enumerate(gen_results):
+            # Build sub-batch: repeat prompts for each candidate in this sub-batch
+            sub_batch_texts = prompt_texts * batch_n
+            sub_batch_prompts = step_prompts * batch_n
+            sub_batch_candidate_ids = []
+            for cand_idx in batch_cand_indices:
+                sub_batch_candidate_ids.extend([cand_idx] * n_prompts)
+
+            # (a) Generate (GPU, heavy)
+            t0 = time.perf_counter()
+            sub_results = model.generate_sub_batch(
+                sub_batch_prompts, sub_batch_texts, sub_batch_candidate_ids, module_lora_params, max_new_tokens
+            )
+            t_gen = time.perf_counter() - t0
+
+            # (b) Immediately: write traces + fire judge calls
+            for cand_idx, resp in sub_results:
+                candidate_responses[cand_idx].append(resp)
+                prompt_idx = len(candidate_responses[cand_idx]) - 1
+
                 rl = ResponseLengths(
                     reasoning_tokens=resp.reasoning_tokens,
                     content_tokens=resp.content_tokens,
@@ -146,20 +155,31 @@ def evolve(
                     raw_response=resp.raw if resp.raw != resp.content else None,
                 )
 
-            # Fire judge calls (non-blocking)
-            tasks = [judge.submit(p, r.content) for p, r in zip(step_prompts, gen_results, strict=True)]
-            all_judge_tasks.append((cand_idx, sign_label, pair_idx, gen_results, tasks))
+                task = judge.submit(resp.prompt, resp.content)
+                candidate_judge_tasks[cand_idx].append(task)
+                pbar.update(1)  # generation step done
 
-        # Compute KL per candidate (requires loading adapter)
-        candidate_kls = []
-        for cand_idx in range(len(candidate_params)):
-            model.set_lora_from_flat(candidate_params[cand_idx])
-            kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
-            candidate_kls.append(kl)
+            # (c) Compute KL for these candidates (GPU, light — judge runs in background)
+            for cand_idx in batch_cand_indices:
+                model.set_lora_from_flat(candidate_params[cand_idx])
+                candidate_kls[cand_idx] = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
 
-        # Await all judge results
-        for cand_idx, sign_label, pair_idx, gen_results, tasks in all_judge_tasks:
+            # Let judge calls progress
             judge.run_pending()
+
+            log.info(
+                "sub_batch_done",
+                generation=gen + 1,
+                candidates=f"{batch_start + 1}-{batch_end}/{n_candidates}",
+                t_gen=f"{t_gen:.1f}s",
+            )
+
+        # --- Await judge results + compute scores ---
+        scores_plus: list[float] = []
+        scores_minus: list[float] = []
+
+        for cand_idx, (sign_label, pair_idx) in enumerate(candidate_labels):
+            tasks = candidate_judge_tasks[cand_idx]
             results = judge.await_all(tasks, pbar=pbar)
 
             for prompt_idx, r in enumerate(results):
@@ -173,7 +193,8 @@ def evolve(
                 )
 
             refusals = sum(1 for r in results if r.is_refusal is True or r.is_refusal is None)
-            compliance_rate = 1.0 - (refusals / len(step_prompts))
+            n_errors = sum(1 for r in results if r.error is not None)
+            compliance_rate = 1.0 - (refusals / n_prompts)
             kl = candidate_kls[cand_idx]
             score = compliance_rate - kl_weight * kl
 
@@ -182,11 +203,11 @@ def evolve(
             else:
                 scores_minus.append(score)
 
+            gen_results = candidate_responses[cand_idx]
             total_tok = sorted(r.total_tokens for r in gen_results)
             reasoning_tok = sorted(r.reasoning_tokens for r in gen_results)
             judge_reasoning_tok = sorted(r.lengths.reasoning_tokens for r in results if r.lengths is not None)
             judge_total_tok = sorted(r.lengths.total_tokens for r in results if r.lengths is not None)
-            n_errors = sum(1 for r in results if r.error is not None)
 
             log.info(
                 "candidate_eval",
@@ -208,22 +229,19 @@ def evolve(
                 if r.error is not None:
                     log.warning("judge_error", gen=gen + 1, cand=cand_idx + 1, error=r.error)
 
-        # Compute ES gradient
+        # --- ES gradient ---
         grad = torch.zeros(n_params, device=device)
         for noise, sp, sm in zip(noise_vectors, scores_plus, scores_minus, strict=True):
             grad += (sp - sm) * noise
         grad /= n_pairs * noise_std
 
-        # Gradient ascent
         params = params + learning_rate * grad
 
         mean_score = sum(scores_plus) / len(scores_plus)
-        grad_norm = grad.norm().item()
-
         log.info(
             "es_update",
             generation=gen + 1,
-            grad_norm=round(grad_norm, 6),
+            grad_norm=round(grad.norm().item(), 6),
             param_norm=round(params.norm().item(), 4),
             mean_score_plus=round(sum(scores_plus) / len(scores_plus), 4),
             mean_score_minus=round(sum(scores_minus) / len(scores_minus), 4),

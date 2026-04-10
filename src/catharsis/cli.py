@@ -48,7 +48,7 @@ def run(
     log.info("prompts_loaded", good_eval=len(good_eval), bad_eval=len(bad_eval))
 
     log.info("computing_base_logprobs")
-    base_logprobs = m.get_logprobs(good_eval, batch_size=batch_size)
+    base_logprobs = m.get_base_logprobs(good_eval, batch_size=batch_size)
     log.info("base_logprobs_ready")
 
     log.info(

@@ -1,8 +1,8 @@
-"""Model loading, LoRA perturbation, and generation."""
+"""Model loading, LoRA perturbation, and generation primitives."""
 
 import re
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import cast
 
 import torch
 import torch.nn.functional as F
@@ -20,12 +20,12 @@ class GeneratedResponse:
     """A single generated response with reasoning/content split."""
 
     prompt: str
-    content: str  # The actual answer (post-thinking)
-    reasoning: str  # The thinking trace (if any)
-    raw: str  # Full raw output with special tokens
-    total_tokens: int  # Total generated tokens
-    reasoning_tokens: int  # Tokens in the thinking trace
-    content_tokens: int  # Tokens in the actual answer
+    content: str
+    reasoning: str
+    raw: str
+    total_tokens: int
+    reasoning_tokens: int
+    content_tokens: int
 
 
 class Model:
@@ -43,20 +43,16 @@ class Model:
         self.enable_thinking = enable_thinking
 
         self.processor = AutoProcessor.from_pretrained(model_name)
-        # AutoProcessor returns either a Processor (with .tokenizer) or a Tokenizer directly
         self.tokenizer = getattr(self.processor, "tokenizer", self.processor)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
 
         self.base_model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            dtype=dtype,
-            device_map=device_map,
+            model_name, dtype=dtype, device_map=device_map
         )
         self.base_model.eval()
 
-        # Detect architecture and configure LoRA targets
         self.arch: ArchConfig = detect_arch(self.base_model.config)
         self.lora_targets = lora_targets or self.arch.default_lora_targets
         log.info(
@@ -66,8 +62,6 @@ class Model:
             lora_targets=self.lora_targets,
         )
 
-        # Scope LoRA to the transformer layers path to avoid unsupported
-        # module types in vision/audio towers (e.g. Gemma4ClippableLinear).
         leaf_names = "|".join(re.escape(t) for t in self.lora_targets)
         target_modules = f"{re.escape(self.arch.layers_path)}\\..*\\.({leaf_names})"
 
@@ -85,27 +79,27 @@ class Model:
     def device(self) -> torch.device:
         return next(self.model.parameters()).device
 
+    # --- LoRA parameter management ---
+
     def get_lora_params(self) -> list[Tensor]:
-        """Get all LoRA A and B weight tensors."""
         return [p for _, p in self.model.named_parameters() if "lora_" in _ and p.requires_grad]
 
     def get_lora_named_params(self) -> tuple[list[str], list[Tensor]]:
-        """Get LoRA param names and tensors (for saving adapters)."""
-        names = []
-        params = []
+        names, params = [], []
         for name, p in self.model.named_parameters():
             if "lora_" in name and p.requires_grad:
                 names.append(name)
                 params.append(p)
         return names, params
 
+    def get_lora_param_shapes(self) -> list[tuple[int, ...]]:
+        return [tuple(p.shape) for p in self.get_lora_params()]
+
     def zero_lora(self):
-        """Reset all LoRA weights to zero (identity)."""
         for param in self.get_lora_params():
             param.data.zero_()
 
     def set_lora_from_flat(self, flat: Tensor):
-        """Set LoRA params from a flat vector."""
         offset = 0
         for param in self.get_lora_params():
             n = param.numel()
@@ -113,135 +107,28 @@ class Model:
             offset += n
 
     def get_lora_flat(self) -> Tensor:
-        """Get all LoRA params as a single flat vector."""
         return torch.cat([p.data.flatten() for p in self.get_lora_params()])
 
     def lora_param_count(self) -> int:
         return sum(p.numel() for p in self.get_lora_params())
 
-    def get_lora_param_shapes(self) -> list[tuple[int, ...]]:
-        """Get shapes of all LoRA params (for batched generation)."""
-        return [tuple(p.shape) for p in self.get_lora_params()]
+    # --- Batched LoRA preparation ---
 
-    def generate_batched_candidates(
-        self,
-        prompts: list[str],
-        candidate_params: list[Tensor],
-        system_prompt: str = "You are a helpful assistant.",
-        max_new_tokens: int = 2000,
-        max_batch_sequences: int = 64,
-        pbar: Any = None,
-    ) -> dict[int, list[GeneratedResponse]]:
-        """Generate responses for ALL candidates, sub-batched to fit in VRAM.
+    def prepare_batched_lora(self, candidate_params: list[Tensor]) -> dict[str, tuple[Tensor, Tensor]]:
+        """Precompute per-module stacked LoRA params for batched generation.
 
-        Each candidate's LoRA perturbation is applied per-sample via hooks,
-        so the base weights are shared. Sub-batches process multiple candidates
-        simultaneously while staying within memory limits.
-
-        Args:
-            prompts: List of prompts (same for all candidates).
-            candidate_params: List of flat LoRA param vectors, one per candidate.
-            max_batch_sequences: Max sequences per sub-batch (controls VRAM usage).
-
-        Returns:
-            Dict mapping candidate index -> list of GeneratedResponse.
+        Call once per generation, reuse across sub-batches.
         """
-        n_candidates = len(candidate_params)
-        n_prompts = len(prompts)
-
-        # Build per-module stacked LoRA params (all candidates)
         lora_names, _ = self.get_lora_named_params()
         lora_shapes = self.get_lora_param_shapes()
-        module_lora_params = build_module_lora_params(
-            self.model,
-            candidate_params,
-            lora_names,
-            lora_shapes,
-            self.device,
-        )
+        return build_module_lora_params(self.model, candidate_params, lora_names, lora_shapes, self.device)
 
-        # Tokenize prompts once
-        chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in prompts]
-        texts = self.processor.apply_chat_template(
-            chats,
-            add_generation_prompt=True,
-            tokenize=False,
-            enable_thinking=self.enable_thinking,
-        )
-
-        results: dict[int, list[GeneratedResponse]] = {i: [] for i in range(n_candidates)}
-        tokenizer = self.tokenizer
-        pad_id = tokenizer.pad_token_id
-
-        # How many candidates fit per sub-batch
-        cands_per_batch = max(1, max_batch_sequences // n_prompts)
-
-        # Process in sub-batches
-        for batch_start in range(0, n_candidates, cands_per_batch):
-            batch_end = min(batch_start + cands_per_batch, n_candidates)
-            batch_cand_indices = list(range(batch_start, batch_end))
-            batch_n_cands = len(batch_cand_indices)
-
-            # Build sub-batch texts: repeat prompts for each candidate in this sub-batch
-            batch_texts = texts * batch_n_cands
-            inputs = self.processor(text=batch_texts, return_tensors="pt", padding=True).to(self.device)
-            input_len = inputs["input_ids"].shape[-1]
-
-            # Map samples to candidate indices within the sub-batch module params
-            candidate_ids = torch.repeat_interleave(torch.arange(batch_start, batch_end, device=self.device), n_prompts)
-
-            self.model.disable_adapter_layers()
-            try:
-                with BatchedLoRAContext(self.model, module_lora_params, candidate_ids):
-                    with torch.no_grad():
-                        outputs = self.model.generate(
-                            **inputs,
-                            max_new_tokens=max_new_tokens,
-                            do_sample=False,
-                            pad_token_id=pad_id,
-                        )
-            finally:
-                self.model.enable_adapter_layers()
-
-            for idx, output in enumerate(outputs):
-                cand_offset = idx // n_prompts
-                prompt_idx = idx % n_prompts
-                cand_idx = batch_cand_indices[cand_offset]
-                generated_ids = output[input_len:]
-                if pad_id is not None:
-                    generated_ids = generated_ids[generated_ids != pad_id]
-                results[cand_idx].append(self._parse_output(prompts[prompt_idx], generated_ids.tolist()))
-
-            if pbar is not None:
-                pbar.update(batch_n_cands * n_prompts)
-
-            log.info(
-                "sub_batch_done",
-                candidates=f"{batch_start + 1}-{batch_end}/{n_candidates}",
-                sequences=batch_n_cands * n_prompts,
-            )
-
-        return results
-
-    def _tokenize_prompts(
-        self, prompts: list[str], system_prompt: str = "You are a helpful assistant."
-    ) -> list[list[int]]:
-        """Tokenize prompts with chat template. Returns list of token ID lists."""
-        chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in prompts]
-        texts = self.processor.apply_chat_template(
-            chats,
-            add_generation_prompt=True,
-            tokenize=False,
-            enable_thinking=self.enable_thinking,
-        )
-        return [self.tokenizer.encode(t) for t in texts]
+    # --- Generation primitives ---
 
     def _parse_output(self, prompt: str, generated_tokens: list[int]) -> GeneratedResponse:
-        """Parse generated token IDs into a GeneratedResponse."""
         tokenizer = self.tokenizer
         raw = tokenizer.decode(generated_tokens, skip_special_tokens=False)
 
-        # Use parse_response if available (Gemma4 processor), fall back to clean decode
         content = raw
         reasoning = ""
         if hasattr(self.processor, "parse_response") and hasattr(self.processor, "response_schema"):
@@ -253,7 +140,6 @@ class Model:
             except (AttributeError, Exception):
                 pass
         if content == raw:
-            # Fall back: strip special tokens for content
             content = tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
         reasoning_tokens = len(tokenizer.encode(reasoning, add_special_tokens=False)) if reasoning else 0
@@ -269,103 +155,78 @@ class Model:
             content_tokens=content_tokens,
         )
 
-    def generate_responses(
+    def tokenize_prompts(self, prompts: list[str], system_prompt: str = "You are a helpful assistant.") -> list[str]:
+        """Apply chat template to prompts. Returns list of formatted text strings."""
+        chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in prompts]
+        return self.processor.apply_chat_template(
+            chats, add_generation_prompt=True, tokenize=False, enable_thinking=self.enable_thinking
+        )
+
+    def generate_sub_batch(
         self,
         prompts: list[str],
-        system_prompt: str = "You are a helpful assistant.",
+        prompt_texts: list[str],
+        candidate_indices: list[int],
+        module_lora_params: dict[str, tuple[Tensor, Tensor]],
         max_new_tokens: int = 2000,
-        batch_size: int = 32,
-    ) -> list[GeneratedResponse]:
-        """Generate responses for a list of prompts."""
-        all_results = []
-        for i in range(0, len(prompts), batch_size):
-            batch = prompts[i : i + batch_size]
-            chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in batch]
-            texts = self.processor.apply_chat_template(
-                chats,
-                add_generation_prompt=True,
-                tokenize=False,
-                enable_thinking=self.enable_thinking,
-            )
-            inputs = self.processor(text=texts, return_tensors="pt", padding=True).to(self.device)
-            input_len = inputs["input_ids"].shape[-1]
+    ) -> list[tuple[int, GeneratedResponse]]:
+        """Generate one sub-batch with per-sample LoRA hooks.
 
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                )
+        Args:
+            prompts: Original prompt strings (for parse_output).
+            prompt_texts: Tokenizable texts (from tokenize_prompts), repeated per candidate.
+            candidate_indices: Which candidate each sequence belongs to.
+            module_lora_params: Precomputed from prepare_batched_lora.
+            max_new_tokens: Max tokens to generate.
 
-            tokenizer = self.tokenizer
-            pad_id = tokenizer.pad_token_id
-            for j, output in enumerate(outputs):
-                generated_ids = output[input_len:]
-                if pad_id is not None:
-                    generated_ids = generated_ids[generated_ids != pad_id]
-                all_results.append(self._parse_output(batch[j], generated_ids.tolist()))
-        return all_results
-
-    def generate_responses_streaming(
-        self,
-        prompts: list[str],
-        system_prompt: str = "You are a helpful assistant.",
-        max_new_tokens: int = 2000,
-        batch_size: int = 32,
-    ):
-        """Yield GeneratedResponse objects as each batch completes.
-
-        TODO: Switch to continuous batching (generate_batch) once transformers
-        supports Gemma4's composite config in PagedAttentionCache.
+        Returns:
+            List of (candidate_index, GeneratedResponse) pairs.
         """
-        for i in range(0, len(prompts), batch_size):
-            batch = prompts[i : i + batch_size]
-            chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in batch]
-            texts = self.processor.apply_chat_template(
-                chats,
-                add_generation_prompt=True,
-                tokenize=False,
-                enable_thinking=self.enable_thinking,
-            )
-            inputs = self.processor(text=texts, return_tensors="pt", padding=True).to(self.device)
-            input_len = inputs["input_ids"].shape[-1]
+        inputs = self.processor(text=prompt_texts, return_tensors="pt", padding=True).to(self.device)
+        input_len = inputs["input_ids"].shape[-1]
+        candidate_ids = torch.tensor(candidate_indices, device=self.device)
 
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                )
+        self.model.disable_adapter_layers()
+        try:
+            with BatchedLoRAContext(self.model, module_lora_params, candidate_ids):
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.pad_token_id,
+                    )
+        finally:
+            self.model.enable_adapter_layers()
 
-            tokenizer = self.tokenizer
-            pad_id = tokenizer.pad_token_id
-            for j, output in enumerate(outputs):
-                generated_ids = output[input_len:]
-                if pad_id is not None:
-                    generated_ids = generated_ids[generated_ids != pad_id]
-                yield self._parse_output(batch[j], generated_ids.tolist())
+        pad_id = self.tokenizer.pad_token_id
+        results = []
+        for idx, output in enumerate(outputs):
+            generated_ids = output[input_len:]
+            if pad_id is not None:
+                generated_ids = generated_ids[generated_ids != pad_id]
+            cand_idx = candidate_indices[idx]
+            prompt = prompts[idx % len(prompts)] if len(prompts) < len(prompt_texts) else prompts[idx]
+            results.append((cand_idx, self._parse_output(prompt, generated_ids.tolist())))
+        return results
 
-    def get_logprobs(
-        self,
-        prompts: list[str],
-        system_prompt: str = "You are a helpful assistant.",
-        batch_size: int = 32,
-    ) -> Tensor:
-        """Get first-token log probability distributions for KL computation."""
+    # --- KL divergence ---
+
+    def compute_kl(self, good_prompts: list[str], base_logprobs: Tensor, batch_size: int = 32) -> float:
+        """Compute KL divergence from base model on good prompts. Uses current LoRA weights."""
+        current_logprobs = self._get_logprobs(good_prompts, batch_size=batch_size)
+        return F.kl_div(current_logprobs, base_logprobs, reduction="batchmean", log_target=True).item()
+
+    def get_base_logprobs(self, good_prompts: list[str], batch_size: int = 32) -> Tensor:
+        """Compute base model logprobs (call once at startup)."""
+        return self._get_logprobs(good_prompts, batch_size=batch_size)
+
+    def _get_logprobs(self, prompts: list[str], batch_size: int = 32) -> Tensor:
         all_logprobs = []
-        for i in range(0, len(prompts), batch_size):
-            batch = prompts[i : i + batch_size]
-            chats = [[{"role": "system", "content": system_prompt}, {"role": "user", "content": p}] for p in batch]
-            texts = self.processor.apply_chat_template(
-                chats,
-                add_generation_prompt=True,
-                tokenize=False,
-                enable_thinking=self.enable_thinking,
-            )
-            inputs = self.processor(text=texts, return_tensors="pt", padding=True).to(self.device)
-
+        texts = self.tokenize_prompts(prompts)
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i : i + batch_size]
+            inputs = self.processor(text=batch_texts, return_tensors="pt", padding=True).to(self.device)
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
@@ -379,7 +240,31 @@ class Model:
             all_logprobs.append(F.log_softmax(logits, dim=-1).cpu())
         return torch.cat(all_logprobs, dim=0)
 
-    def compute_kl(self, good_prompts: list[str], base_logprobs: Tensor, batch_size: int = 32) -> float:
-        """Compute KL divergence from base model on good prompts."""
-        current_logprobs = self.get_logprobs(good_prompts, batch_size=batch_size)
-        return F.kl_div(current_logprobs, base_logprobs, reduction="batchmean", log_target=True).item()
+    # --- Convenience (for non-batched use like saving) ---
+
+    def generate_responses(
+        self,
+        prompts: list[str],
+        system_prompt: str = "You are a helpful assistant.",
+        max_new_tokens: int = 2000,
+        batch_size: int = 32,
+    ) -> list[GeneratedResponse]:
+        """Simple sequential generation with current LoRA weights."""
+        all_results = []
+        texts = self.tokenize_prompts(prompts, system_prompt)
+        for i in range(0, len(texts), batch_size):
+            batch_texts = texts[i : i + batch_size]
+            batch_prompts = prompts[i : i + batch_size]
+            inputs = self.processor(text=batch_texts, return_tensors="pt", padding=True).to(self.device)
+            input_len = inputs["input_ids"].shape[-1]
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=self.tokenizer.pad_token_id
+                )
+            pad_id = self.tokenizer.pad_token_id
+            for j, output in enumerate(outputs):
+                generated_ids = output[input_len:]
+                if pad_id is not None:
+                    generated_ids = generated_ids[generated_ids != pad_id]
+                all_results.append(self._parse_output(batch_prompts[j], generated_ids.tolist()))
+        return all_results
