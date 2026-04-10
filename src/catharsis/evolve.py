@@ -138,22 +138,24 @@ def evolve(
     learning_rate: float = 0.01,
     batch_size: int = 32,
     max_new_tokens: int = 1000,
+    prompts_per_step: int | None = None,
 ) -> Tensor:
     """
     Evolution strategies with antithetic sampling over LoRA parameters.
 
     For each generation:
-    1. Sample N/2 noise vectors
-    2. Evaluate both +noise and -noise (antithetic pairs)
-    3. Compute ES gradient: grad = mean((score_plus - score_minus) * noise) / sigma
-    4. Update params with gradient ascent
-
-    This is much more robust than tournament selection — the noise magnitude
-    only needs to produce different scores for +/- pairs, not find the optimum directly.
+    1. Sample a random mini-batch of bad prompts
+    2. Sample N/2 noise vectors
+    3. Evaluate both +noise and -noise (antithetic pairs)
+    4. Compute ES gradient: grad = mean((score_plus - score_minus) * noise) / sigma
+    5. Update params with gradient ascent
     """
+    import random
+
     n_params = model.lora_param_count()
     device = model.device
     n_pairs = population_size // 2  # antithetic pairs
+    n_prompts = prompts_per_step or len(bad_prompts)
 
     params = model.get_lora_flat().clone()
     best_score = float("-inf")
@@ -175,12 +177,13 @@ def evolve(
         kl_weight=kl_weight,
         n_good=len(good_prompts),
         n_bad=len(bad_prompts),
+        prompts_per_step=n_prompts,
         max_new_tokens=max_new_tokens,
     )
     log.info("trace_dir", path=str(trace.base_dir))
 
-    # Total steps: each pair = 2 candidates, each candidate = N prompts generate + N prompts judge
-    total_steps = generations * n_pairs * 2 * len(bad_prompts) * 2
+    # Total steps: each pair = 2 candidates, each candidate = n_prompts generate + n_prompts judge
+    total_steps = generations * n_pairs * 2 * n_prompts * 2
     pbar = tqdm(total=total_steps, desc="best=0%", unit="step")
 
     gen_start = time.perf_counter()
@@ -188,6 +191,12 @@ def evolve(
     for gen in range(generations):
         gen_t0 = time.perf_counter()
         pbar.set_description(f"Gen {gen + 1}/{generations} | best={best_compliance}%")
+
+        # Sample mini-batch of bad prompts for this step
+        if n_prompts < len(bad_prompts):
+            step_prompts = random.sample(bad_prompts, n_prompts)
+        else:
+            step_prompts = bad_prompts
 
         # Sample noise vectors and evaluate antithetic pairs
         noise_vectors = []
@@ -203,7 +212,7 @@ def evolve(
             score_plus, data_plus = _evaluate_candidate(
                 model,
                 judge,
-                bad_prompts,
+                step_prompts,
                 good_prompts,
                 base_logprobs,
                 kl_weight,
@@ -229,7 +238,7 @@ def evolve(
             score_minus, data_minus = _evaluate_candidate(
                 model,
                 judge,
-                bad_prompts,
+                step_prompts,
                 good_prompts,
                 base_logprobs,
                 kl_weight,

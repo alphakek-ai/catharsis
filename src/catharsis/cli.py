@@ -22,7 +22,7 @@ def run(
     kl_weight: Annotated[float, typer.Option(help="KL divergence penalty weight")] = 1.0,
     batch_size: Annotated[int, typer.Option(help="Inference batch size")] = 32,
     max_new_tokens: Annotated[int, typer.Option(help="Max tokens per response")] = 2000,
-    n_eval: Annotated[int, typer.Option(help="Number of eval prompts")] = 100,
+    prompts_per_step: Annotated[int, typer.Option(help="Bad prompts sampled per generation step")] = 10,
     output_dir: Annotated[Optional[str], typer.Option(help="Output directory")] = None,
 ):
     """Run evolutionary LoRA search with LLM judge fitness."""
@@ -43,7 +43,7 @@ def run(
     log.info("judge_ready", model=judge.model)
 
     log.info("loading_prompts")
-    good_train, bad_train, good_eval, bad_eval = load_default_prompts(n_eval=n_eval)
+    good_train, bad_train, good_eval, bad_eval = load_default_prompts()
     log.info("prompts_loaded", good_eval=len(good_eval), bad_eval=len(bad_eval))
 
     log.info("computing_base_logprobs")
@@ -56,6 +56,7 @@ def run(
         generations=generations,
         noise_std=noise_std,
         learning_rate=learning_rate,
+        prompts_per_step=prompts_per_step,
     )
     evolve(
         model=m,
@@ -70,6 +71,7 @@ def run(
         learning_rate=learning_rate,
         batch_size=batch_size,
         max_new_tokens=max_new_tokens,
+        prompts_per_step=prompts_per_step,
     )
 
     out = output_dir or f"{model.replace('/', '--')}-catharsis"
