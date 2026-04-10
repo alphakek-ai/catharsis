@@ -189,6 +189,7 @@ def evolve(
                     prompt_idx=prompt_idx,
                     is_refusal=r.is_refusal,
                     judge_lengths=r.lengths,
+                    judge_reasoning=r.reasoning,
                     judge_error=r.error,
                 )
 

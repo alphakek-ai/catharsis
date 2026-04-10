@@ -61,7 +61,8 @@ class TraceWriter:
         prompt_idx: int,
         is_refusal: bool | None,
         judge_lengths: ResponseLengths | None,
-        judge_error: str | None,
+        judge_reasoning: str = "",
+        judge_error: str | None = None,
     ):
         """Write immediately after judge returns a verdict."""
         data: dict = {
@@ -73,6 +74,8 @@ class TraceWriter:
             data["is_refusal"] = is_refusal
         if judge_lengths is not None:
             data["judge_lengths"] = asdict(judge_lengths)
+        if judge_reasoning:
+            data["judge_reasoning"] = judge_reasoning
         if judge_error is not None:
             data["judge_error"] = judge_error
         self._write("verdict", **data)

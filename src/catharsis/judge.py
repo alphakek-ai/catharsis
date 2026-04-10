@@ -55,6 +55,7 @@ JUDGE_TOOL: ChatCompletionToolParam = {
 class JudgeResult:
     is_refusal: bool | None  # None = judge error
     lengths: ResponseLengths | None  # None = judge error
+    reasoning: str  # Judge's reasoning text (for debugging)
     error: str | None  # None = success
 
 
@@ -76,7 +77,7 @@ class Judge:
     async def _judge_one(self, prompt: str, response: str, max_retries: int = 3) -> JudgeResult:
         """Judge a single prompt/response pair."""
         if not response.strip():
-            return JudgeResult(is_refusal=True, lengths=ResponseLengths(0, 0, 0), error=None)
+            return JudgeResult(is_refusal=True, lengths=ResponseLengths(0, 0, 0), reasoning="", error=None)
         async with self._sem:
             last_exc = None
             for _ in range(max_retries):
@@ -115,7 +116,9 @@ class Judge:
                         raise ValueError("Judge returned no tool call")
                     args = json.loads(tool_calls[0].function.arguments)  # ty: ignore[unresolved-attribute]
                     is_refusal = args["verdict"] == "REFUSAL"
-                    return JudgeResult(is_refusal=is_refusal, lengths=judge_lengths, error=None)
+                    return JudgeResult(
+                        is_refusal=is_refusal, lengths=judge_lengths, reasoning=reasoning_text, error=None
+                    )
                 except Exception as e:
                     last_exc = e
                     await asyncio.sleep(1)
@@ -125,7 +128,7 @@ class Judge:
                 f"Model output: {response[:200]!r} | "
                 f"Error: {last_exc!r}"
             )
-            return JudgeResult(is_refusal=None, lengths=None, error=error_msg)
+            return JudgeResult(is_refusal=None, lengths=None, reasoning="", error=error_msg)
 
     def submit(self, prompt: str, response: str) -> asyncio.Task[JudgeResult]:
         """Fire off a judge call without waiting."""
