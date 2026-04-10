@@ -2,7 +2,7 @@
 
 import re
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -130,6 +130,7 @@ class Model:
         system_prompt: str = "You are a helpful assistant.",
         max_new_tokens: int = 2000,
         max_batch_sequences: int = 64,
+        pbar: Any = None,
     ) -> dict[int, list[GeneratedResponse]]:
         """Generate responses for ALL candidates, sub-batched to fit in VRAM.
 
@@ -210,6 +211,9 @@ class Model:
                 if pad_id is not None:
                     generated_ids = generated_ids[generated_ids != pad_id]
                 results[cand_idx].append(self._parse_output(prompts[prompt_idx], generated_ids.tolist()))
+
+            if pbar is not None:
+                pbar.update(batch_n_cands * n_prompts)
 
             log.info(
                 "sub_batch_done",

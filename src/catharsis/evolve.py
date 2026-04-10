@@ -106,10 +106,13 @@ def evolve(
         # Generate ALL candidates in ONE forward pass
         t0 = time.perf_counter()
         all_results = model.generate_batched_candidates(
-            step_prompts, candidate_params, max_new_tokens=max_new_tokens, max_batch_sequences=max_batch_sequences
+            step_prompts,
+            candidate_params,
+            max_new_tokens=max_new_tokens,
+            max_batch_sequences=max_batch_sequences,
+            pbar=pbar,
         )
         t_gen = time.perf_counter() - t0
-        pbar.update(len(candidate_params) * len(step_prompts))  # generation steps
 
         log.info(
             "batched_generation_done",
