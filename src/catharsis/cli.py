@@ -17,7 +17,8 @@ def run(
     lora_targets: Annotated[Optional[list[str]], typer.Option(help="LoRA target modules")] = None,
     population_size: Annotated[int, typer.Option(help="Candidates per generation")] = 16,
     generations: Annotated[int, typer.Option(help="Number of generations")] = 100,
-    noise_std: Annotated[float, typer.Option(help="Perturbation noise std")] = 0.001,
+    noise_std: Annotated[float, typer.Option(help="Perturbation noise std")] = 0.01,
+    learning_rate: Annotated[float, typer.Option(help="ES gradient ascent learning rate")] = 0.01,
     kl_weight: Annotated[float, typer.Option(help="KL divergence penalty weight")] = 1.0,
     batch_size: Annotated[int, typer.Option(help="Inference batch size")] = 32,
     max_new_tokens: Annotated[int, typer.Option(help="Max tokens per response")] = 2000,
@@ -49,7 +50,13 @@ def run(
     base_logprobs = m.get_logprobs(good_eval, batch_size=batch_size)
     log.info("base_logprobs_ready")
 
-    log.info("starting_evolution", population_size=population_size, generations=generations, noise_std=noise_std)
+    log.info(
+        "starting_evolution",
+        population_size=population_size,
+        generations=generations,
+        noise_std=noise_std,
+        learning_rate=learning_rate,
+    )
     evolve(
         model=m,
         judge=judge,
@@ -60,6 +67,7 @@ def run(
         generations=generations,
         noise_std=noise_std,
         kl_weight=kl_weight,
+        learning_rate=learning_rate,
         batch_size=batch_size,
         max_new_tokens=max_new_tokens,
     )
