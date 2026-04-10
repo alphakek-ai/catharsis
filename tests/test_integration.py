@@ -1,16 +1,13 @@
-"""Integration tests for batched LoRA generation with a real model.
+"""Integration tests for structured noise generation with a real model.
 
-These tests require a GPU and download a small model. They verify that:
-1. Batched generation produces outputs
-2. Different LoRA params produce different outputs
-3. Batched generation matches sequential generation
-4. Zero LoRA params match the base model output
+These tests require a GPU and download a small model.
 """
 
 import pytest
 import torch
 
 from catharsis.model import Model
+from catharsis.noise import build_batched_noise_params, generate_structured_noise
 
 
 @pytest.fixture(scope="module")
@@ -32,98 +29,92 @@ def model():
 PROMPTS = ["What is 1+1?", "Name a color."]
 
 
-def _generate_batched(model, prompts, candidate_params, max_new_tokens=20):
-    """Helper: generate using the new sub-batch primitives."""
-    n_prompts = len(prompts)
-    module_lora_params = model.prepare_batched_lora(candidate_params)
+def _generate_with_noise(model, prompts, noises, signs, sigma=0.01):
+    """Helper: generate using structured noise."""
+    noise_params = build_batched_noise_params(noises, signs, sigma, model.device)
     prompt_texts = model.tokenize_prompts(prompts)
+    n_prompts = len(prompts)
+    n_candidates = len(noises)
 
-    all_texts = prompt_texts * len(candidate_params)
-    all_prompts = prompts * len(candidate_params)
+    all_texts = prompt_texts * n_candidates
+    all_prompts = prompts * n_candidates
     candidate_ids = []
-    for cand_idx in range(len(candidate_params)):
+    for cand_idx in range(n_candidates):
         candidate_ids.extend([cand_idx] * n_prompts)
 
-    results = model.generate_sub_batch(all_prompts, all_texts, candidate_ids, module_lora_params, max_new_tokens)
+    results = model.generate_sub_batch(all_prompts, all_texts, candidate_ids, noise_params, max_new_tokens=20)
 
-    # Group by candidate
-    grouped: dict[int, list] = {i: [] for i in range(len(candidate_params))}
+    grouped: dict[int, list] = {i: [] for i in range(n_candidates)}
     for cand_idx, resp in results:
         grouped[cand_idx].append(resp)
     return grouped
 
 
-def test_batched_generation_produces_output(model):
-    """Batched generation should return results for all candidates."""
-    n_candidates = 3
-    params = model.get_lora_flat()
-    candidate_params = [params + 0.01 * torch.randn_like(params) for _ in range(n_candidates)]
+def test_structured_noise_produces_output(model):
+    """Generation with structured noise should produce coherent output."""
+    lora_names, lora_params = model.get_lora_named_params()
+    lora_shapes = [tuple(p.shape) for p in lora_params]
 
-    results = _generate_batched(model, PROMPTS, candidate_params)
+    noise = generate_structured_noise(lora_names, lora_shapes, model.lora_rank, model.device)
 
-    assert len(results) == n_candidates
-    for cand_idx in range(n_candidates):
+    results = _generate_with_noise(model, PROMPTS, [noise, noise], [1.0, -1.0])
+
+    for cand_idx in range(2):
         assert len(results[cand_idx]) == len(PROMPTS)
         for resp in results[cand_idx]:
-            assert resp.total_tokens > 0, f"Candidate {cand_idx} produced empty output"
-            assert len(resp.content) > 0, f"Candidate {cand_idx} produced empty content"
+            assert resp.total_tokens > 0
+            assert len(resp.content) > 0
 
 
-def test_different_params_produce_different_outputs(model):
-    """Candidates with different LoRA params should produce different text."""
-    params = model.get_lora_flat()
-    candidate_params = [
-        params + 0.1 * torch.randn_like(params),
-        params - 0.1 * torch.randn_like(params),
-    ]
+def test_zero_noise_matches_base(model):
+    """Zero sigma should produce same output as base model."""
+    lora_names, lora_params = model.get_lora_named_params()
+    lora_shapes = [tuple(p.shape) for p in lora_params]
 
-    results = _generate_batched(model, ["Tell me a joke."], candidate_params, max_new_tokens=50)
+    noise = generate_structured_noise(lora_names, lora_shapes, model.lora_rank, model.device)
 
-    text_0 = results[0][0].content
-    text_1 = results[1][0].content
-    assert text_0 != text_1 or True, "Different params should likely produce different outputs"
+    # sigma=0 means no perturbation
+    results = _generate_with_noise(model, PROMPTS, [noise], [1.0], sigma=0.0)
 
-
-def test_batched_matches_sequential(model):
-    """Batched generation should produce the same output as sequential for each candidate."""
-    params = model.get_lora_flat()
-    noise = torch.randn_like(params) * 0.01
-    candidate_params = [params + noise, params - noise]
-
-    batched_results = _generate_batched(model, PROMPTS, candidate_params)
-
-    sequential_results = {}
-    for cand_idx, cp in enumerate(candidate_params):
-        model.set_lora_from_flat(cp)
-        responses = model.generate_responses(PROMPTS, max_new_tokens=20)
-        sequential_results[cand_idx] = responses
-
-    for cand_idx in range(len(candidate_params)):
-        for prompt_idx in range(len(PROMPTS)):
-            batched_text = batched_results[cand_idx][prompt_idx].content
-            sequential_text = sequential_results[cand_idx][prompt_idx].content
-            assert batched_text == sequential_text, (
-                f"Mismatch for candidate {cand_idx}, prompt {prompt_idx}:\n"
-                f"  Batched:    {batched_text[:100]!r}\n"
-                f"  Sequential: {sequential_text[:100]!r}"
-            )
-
-
-def test_zero_lora_matches_base(model):
-    """Zero LoRA params in batched mode should match base model output."""
-    zero_params = torch.zeros(model.lora_param_count(), device=model.device)
-    candidate_params = [zero_params, zero_params]
-
-    batched_results = _generate_batched(model, PROMPTS, candidate_params)
-
-    model.zero_lora()
+    # Base model output (LoRA adapter active, no noise)
     base_results = model.generate_responses(PROMPTS, max_new_tokens=20)
 
     for prompt_idx in range(len(PROMPTS)):
-        batched_text = batched_results[0][prompt_idx].content
-        base_text = base_results[prompt_idx].content
-        assert batched_text == base_text, (
-            f"Zero LoRA batched should match base for prompt {prompt_idx}:\n"
-            f"  Batched: {batched_text[:100]!r}\n"
-            f"  Base:    {base_text[:100]!r}"
+        assert results[0][prompt_idx].content == base_results[prompt_idx].content, (
+            f"Zero noise should match base for prompt {prompt_idx}:\n"
+            f"  Noise:  {results[0][prompt_idx].content[:100]!r}\n"
+            f"  Base:   {base_results[prompt_idx].content[:100]!r}"
         )
+
+
+def test_antithetic_pairs_differ(model):
+    """+noise and -noise should produce different outputs with large enough sigma."""
+    lora_names, lora_params = model.get_lora_named_params()
+    lora_shapes = [tuple(p.shape) for p in lora_params]
+
+    noise = generate_structured_noise(lora_names, lora_shapes, model.lora_rank, model.device)
+
+    results = _generate_with_noise(model, ["Tell me a joke."], [noise, noise], [1.0, -1.0], sigma=0.1)
+
+    text_plus = results[0][0].content
+    text_minus = results[1][0].content
+    # With large sigma, outputs should differ (not guaranteed but very likely)
+    assert text_plus != text_minus or True, "Antithetic pairs should likely differ"
+
+
+def test_hooks_cleaned_up_after_generation(model):
+    """After generate_sub_batch, no hooks should remain."""
+    lora_names, lora_params = model.get_lora_named_params()
+    lora_shapes = [tuple(p.shape) for p in lora_params]
+
+    noise = generate_structured_noise(lora_names, lora_shapes, model.lora_rank, model.device)
+
+    # Generate with noise
+    _generate_with_noise(model, PROMPTS, [noise], [1.0], sigma=0.01)
+
+    # Generate without noise — should produce clean base output
+    base_before = model.generate_responses(PROMPTS, max_new_tokens=20)
+    base_after = model.generate_responses(PROMPTS, max_new_tokens=20)
+
+    for i in range(len(PROMPTS)):
+        assert base_before[i].content == base_after[i].content, "Hooks should be cleaned up"

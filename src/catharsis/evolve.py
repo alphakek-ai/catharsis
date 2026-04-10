@@ -1,12 +1,13 @@
-"""Evolution strategies with antithetic sampling over LoRA perturbations.
+"""Evolution strategies with antithetic sampling and structured noise.
 
 Pipeline per generation:
-1. For each sub-batch of candidates:
-   a. Generate responses (GPU, heavy)
-   b. Write traces + fire judge calls (immediate, per response)
-   c. Compute KL for these candidates (GPU, light — while judge runs in background)
-2. Await remaining judge results
-3. Compute scores + ES gradient
+1. Generate structured per-module noise (like EGGROLL)
+2. For each sub-batch of candidates:
+   a. Generate responses with noise hooks (GPU, heavy)
+   b. Write traces + fire judge calls (immediate)
+   c. Compute KL for these candidates (GPU, light — judge in background)
+3. Await judge results, compute scores
+4. Compute ES gradient per-module, update LoRA weights
 """
 
 import random
@@ -19,6 +20,7 @@ from tqdm import tqdm
 from .judge import Judge
 from .log import log
 from .model import Model
+from .noise import StructuredNoise, build_batched_noise_params, generate_structured_noise
 from .trace import ResponseLengths, TraceWriter
 
 
@@ -47,24 +49,27 @@ def evolve(
     prompts_per_step: int | None = None,
     max_batch_sequences: int = 64,
 ) -> Tensor:
-    n_params = model.lora_param_count()
-    device = model.device
     n_pairs = population_size // 2
     n_prompts = prompts_per_step or len(bad_prompts)
+    n_candidates = n_pairs * 2
+    device = model.device
 
-    params = model.get_lora_flat().clone()
+    # Get LoRA structure info for noise generation
+    lora_names, lora_shapes = model.get_lora_named_params()
+    lora_names_list = [n for n in lora_names]
+    lora_shapes_list = [tuple(p.shape) for p in lora_shapes]
+    lora_rank = model.lora_rank
+
     best_score = float("-inf")
     best_compliance = 0
     best_kl = float("inf")
-    best_params = params.clone()
 
     trace = TraceWriter()
     trace.write_meta(
         model=model.model_name,
-        lora_rank=model.lora_rank,
+        lora_rank=lora_rank,
         lora_targets=model.lora_targets,
-        method="antithetic_es",
-        backend="batched_lora",
+        method="antithetic_es_structured",
         population_size=population_size,
         n_pairs=n_pairs,
         generations=generations,
@@ -79,8 +84,6 @@ def evolve(
     )
     log.info("trace_dir", path=str(trace.base_dir))
 
-    n_candidates = n_pairs * 2  # antithetic pairs
-    # Steps: generation + judge per prompt, per candidate, per generation
     total_steps = generations * n_candidates * n_prompts * 2
     pbar = tqdm(total=total_steps, desc="best=0%", unit="step")
 
@@ -94,48 +97,55 @@ def evolve(
         step_prompts = random.sample(bad_prompts, min(n_prompts, len(bad_prompts)))
         prompt_texts = model.tokenize_prompts(step_prompts)
 
-        # Build antithetic candidate params
-        noise_vectors = [torch.randn(n_params, device=device) for _ in range(n_pairs)]
-        candidate_params: list[Tensor] = []
-        candidate_labels: list[tuple[str, int]] = []  # (sign, pair_idx)
-        for pair_idx, noise in enumerate(noise_vectors):
-            candidate_params.append(params + noise_std * noise)
+        # Generate structured noise (per-module, like EGGROLL)
+        noise_samples = [
+            generate_structured_noise(lora_names_list, lora_shapes_list, lora_rank, device) for _ in range(n_pairs)
+        ]
+
+        # Build antithetic candidate list: +noise, -noise for each pair
+        candidate_noises: list[StructuredNoise] = []
+        candidate_signs: list[float] = []
+        candidate_labels: list[tuple[str, int]] = []
+        for pair_idx, noise in enumerate(noise_samples):
+            candidate_noises.append(noise)
+            candidate_signs.append(1.0)
             candidate_labels.append(("+", pair_idx))
-            candidate_params.append(params - noise_std * noise)
+            candidate_noises.append(noise)  # same noise, opposite sign
+            candidate_signs.append(-1.0)
             candidate_labels.append(("-", pair_idx))
 
-        # Precompute module LoRA params (once for all sub-batches)
-        module_lora_params = model.prepare_batched_lora(candidate_params)
+        # Build stacked noise params for hooks (sigma decays linearly)
+        current_sigma = noise_std * (1.0 - gen / generations)
+        all_noise_params = build_batched_noise_params(candidate_noises, candidate_signs, current_sigma, device)
 
         # How many candidates per sub-batch
         cands_per_sub_batch = max(1, max_batch_sequences // n_prompts)
 
-        # Storage for results
+        # Storage
         candidate_responses: dict[int, list] = {i: [] for i in range(n_candidates)}
         candidate_judge_tasks: dict[int, list] = {i: [] for i in range(n_candidates)}
         candidate_kls: dict[int, float] = {}
 
-        # --- Pipeline: generate sub-batch → trace + judge → KL ---
+        # --- Pipeline: generate → trace + judge → KL ---
         for batch_start in range(0, n_candidates, cands_per_sub_batch):
             batch_end = min(batch_start + cands_per_sub_batch, n_candidates)
             batch_cand_indices = list(range(batch_start, batch_end))
             batch_n = len(batch_cand_indices)
 
-            # Build sub-batch: repeat prompts for each candidate in this sub-batch
             sub_batch_texts = prompt_texts * batch_n
             sub_batch_prompts = step_prompts * batch_n
             sub_batch_candidate_ids = []
             for cand_idx in batch_cand_indices:
                 sub_batch_candidate_ids.extend([cand_idx] * n_prompts)
 
-            # (a) Generate (GPU, heavy)
+            # (a) Generate with noise hooks (base LoRA stays active)
             t0 = time.perf_counter()
             sub_results = model.generate_sub_batch(
-                sub_batch_prompts, sub_batch_texts, sub_batch_candidate_ids, module_lora_params, max_new_tokens
+                sub_batch_prompts, sub_batch_texts, sub_batch_candidate_ids, all_noise_params, max_new_tokens
             )
             t_gen = time.perf_counter() - t0
 
-            # (b) Immediately: write traces + fire judge calls
+            # (b) Write traces + fire judge calls
             for cand_idx, resp in sub_results:
                 candidate_responses[cand_idx].append(resp)
                 prompt_idx = len(candidate_responses[cand_idx]) - 1
@@ -157,14 +167,16 @@ def evolve(
 
                 task = judge.submit(resp.prompt, resp.content)
                 candidate_judge_tasks[cand_idx].append(task)
-                pbar.update(1)  # generation step done
+                pbar.update(1)
 
-            # (c) Compute KL for these candidates (GPU, light — judge runs in background)
+            # (c) KL — no adapter swap needed, just compute with base LoRA
+            # (noise was additive via hooks, not baked into weights)
+            # KL for all candidates in this sub-batch is the SAME (base LoRA unchanged)
+            # So we compute once and share
+            kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
             for cand_idx in batch_cand_indices:
-                model.set_lora_from_flat(candidate_params[cand_idx])
-                candidate_kls[cand_idx] = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
+                candidate_kls[cand_idx] = kl
 
-            # Let judge calls progress
             judge.run_pending()
 
             log.info(
@@ -174,7 +186,7 @@ def evolve(
                 t_gen=f"{t_gen:.1f}s",
             )
 
-        # --- Await judge results + compute scores ---
+        # --- Await judge + score ---
         scores_plus: list[float] = []
         scores_minus: list[float] = []
 
@@ -230,28 +242,60 @@ def evolve(
                 if r.error is not None:
                     log.warning("judge_error", gen=gen + 1, cand=cand_idx + 1, error=r.error)
 
-        # --- ES gradient ---
-        grad = torch.zeros(n_params, device=device)
-        for noise, sp, sm in zip(noise_vectors, scores_plus, scores_minus, strict=True):
-            grad += (sp - sm) * noise
-        grad /= n_pairs * noise_std
+        # --- Fitness normalization (like EGGROLL) ---
+        # Normalize all scores to zero mean, unit variance.
+        # This makes gradient magnitude independent of absolute reward scale.
+        all_scores = scores_plus + scores_minus
+        score_mean = sum(all_scores) / len(all_scores)
+        score_var = sum((s - score_mean) ** 2 for s in all_scores) / len(all_scores)
+        score_std = max((score_var + 1e-8) ** 0.5, 1e-8)
+        normalized_plus = [(s - score_mean) / score_std for s in scores_plus]
+        normalized_minus = [(s - score_mean) / score_std for s in scores_minus]
 
-        params = params + learning_rate * grad
+        # --- ES gradient update (per-module, structured) ---
+        # Sigma decays linearly over generations (like EGGROLL)
+        current_sigma = noise_std * (1.0 - gen / generations)
+
+        for name, param in model.model.named_parameters():
+            if "lora_" not in name or not param.requires_grad:
+                continue
+
+            base_name = name.split(".lora_A.")[0] if ".lora_A." in name else name.split(".lora_B.")[0]
+            is_A = ".lora_A." in name
+
+            grad = torch.zeros_like(param)
+            for pair_idx, noise in enumerate(noise_samples):
+                if base_name not in noise.module_noise:
+                    continue
+                noise_A, noise_B = noise.module_noise[base_name]
+                # Use normalized fitness-weighted noise (like EGGROLL)
+                np_score = normalized_plus[pair_idx]
+                nm_score = normalized_minus[pair_idx]
+
+                if is_A:
+                    noise_param = noise_A.to(param.device, param.dtype)
+                    grad += np_score * noise_param  # +noise direction
+                    grad += nm_score * (-noise_param)  # -noise direction (sign is in the noise)
+                else:
+                    noise_param = noise_B.to(param.device, param.dtype)
+                    grad += np_score * noise_param
+                    grad += nm_score * noise_param  # B is not sign-flipped in EGGROLL
+
+            grad /= n_candidates
+            param.data += learning_rate * grad
 
         mean_score = sum(scores_plus) / len(scores_plus)
         log.info(
             "es_update",
             generation=gen + 1,
-            grad_norm=round(grad.norm().item(), 6),
-            param_norm=round(params.norm().item(), 4),
+            sigma=round(current_sigma, 6),
             mean_score_plus=round(sum(scores_plus) / len(scores_plus), 4),
             mean_score_minus=round(sum(scores_minus) / len(scores_minus), 4),
+            score_std=round(score_std, 4),
         )
 
         if mean_score > best_score:
             best_score = mean_score
-            best_params = params.clone()
-            model.set_lora_from_flat(best_params)
             best_kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
             best_compliance = round((best_score + kl_weight * best_kl) * 100)
             log.info("new_best", compliance=best_compliance, kl=round(best_kl, 4), score=round(best_score, 4))
@@ -267,5 +311,4 @@ def evolve(
     trace.close()
     total = time.perf_counter() - gen_start
     log.info("evolution_complete", total_time=_fmt(total), best_compliance=best_compliance, best_kl=round(best_kl, 4))
-    model.set_lora_from_flat(best_params)
-    return best_params
+    return model.get_lora_flat()

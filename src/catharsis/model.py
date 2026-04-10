@@ -11,7 +11,7 @@ from torch import Tensor
 from transformers import AutoModelForCausalLM, AutoProcessor, PreTrainedModel
 
 from .arch import ArchConfig, detect_arch
-from .batched_lora import BatchedLoRAContext, build_module_lora_params
+from .batched_lora import BatchedNoiseContext
 from .log import log
 
 
@@ -112,16 +112,13 @@ class Model:
     def lora_param_count(self) -> int:
         return sum(p.numel() for p in self.get_lora_params())
 
-    # --- Batched LoRA preparation ---
+    # --- Noise info for structured generation ---
 
-    def prepare_batched_lora(self, candidate_params: list[Tensor]) -> dict[str, tuple[Tensor, Tensor]]:
-        """Precompute per-module stacked LoRA params for batched generation.
-
-        Call once per generation, reuse across sub-batches.
-        """
-        lora_names, _ = self.get_lora_named_params()
-        lora_shapes = self.get_lora_param_shapes()
-        return build_module_lora_params(self.model, candidate_params, lora_names, lora_shapes, self.device)
+    def get_lora_info(self) -> tuple[list[str], list[tuple[int, ...]]]:
+        """Return LoRA param names and shapes (needed for noise generation)."""
+        names, _ = self.get_lora_named_params()
+        shapes = self.get_lora_param_shapes()
+        return names, shapes
 
     # --- Generation primitives ---
 
@@ -129,17 +126,24 @@ class Model:
         tokenizer = self.tokenizer
         raw = tokenizer.decode(generated_tokens, skip_special_tokens=False)
 
-        content = raw
+        # Split thinking from content
+        # Gemma4 format: <|channel>thought\n...<channel|>content<turn|>
+        # Qwen format: <think>...</think>content
+        content = ""
         reasoning = ""
-        if hasattr(self.processor, "parse_response") and hasattr(self.processor, "response_schema"):
-            try:
-                parsed = self.processor.parse_response(raw)
-                if isinstance(parsed, dict):
-                    content = parsed.get("content", raw)
-                    reasoning = parsed.get("thinking", "")
-            except (AttributeError, Exception):
-                pass
-        if content == raw:
+
+        if "<|channel>" in raw and "<channel|>" in raw:
+            # Gemma4 thinking format
+            parts = raw.split("<channel|>", 1)
+            reasoning = parts[0].split("<|channel>", 1)[-1].strip()
+            content = parts[1].replace("<turn|>", "").strip() if len(parts) > 1 else ""
+        elif "<think>" in raw and "</think>" in raw:
+            # Qwen thinking format
+            parts = raw.split("</think>", 1)
+            reasoning = parts[0].split("<think>", 1)[-1].strip()
+            content = parts[1].strip() if len(parts) > 1 else ""
+        else:
+            # No thinking — strip special tokens for clean content
             content = tokenizer.decode(generated_tokens, skip_special_tokens=True)
 
         reasoning_tokens = len(tokenizer.encode(reasoning, add_special_tokens=False)) if reasoning else 0
@@ -167,16 +171,19 @@ class Model:
         prompts: list[str],
         prompt_texts: list[str],
         candidate_indices: list[int],
-        module_lora_params: dict[str, tuple[Tensor, Tensor]],
+        module_noise_params: dict[str, tuple[Tensor, Tensor]],
         max_new_tokens: int = 2000,
     ) -> list[tuple[int, GeneratedResponse]]:
-        """Generate one sub-batch with per-sample LoRA hooks.
+        """Generate one sub-batch with per-sample noise corrections.
+
+        The base LoRA adapter stays active. Noise corrections are applied
+        on top via hooks — each sample gets a different perturbation.
 
         Args:
             prompts: Original prompt strings (for parse_output).
             prompt_texts: Tokenizable texts (from tokenize_prompts), repeated per candidate.
             candidate_indices: Which candidate each sequence belongs to.
-            module_lora_params: Precomputed from prepare_batched_lora.
+            module_noise_params: Per-module stacked noise (A, B) from build_batched_noise_params.
             max_new_tokens: Max tokens to generate.
 
         Returns:
@@ -186,18 +193,15 @@ class Model:
         input_len = inputs["input_ids"].shape[-1]
         candidate_ids = torch.tensor(candidate_indices, device=self.device)
 
-        self.model.disable_adapter_layers()
-        try:
-            with BatchedLoRAContext(self.model, module_lora_params, candidate_ids):
-                with torch.no_grad():
-                    outputs = self.model.generate(
-                        **inputs,
-                        max_new_tokens=max_new_tokens,
-                        do_sample=False,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                    )
-        finally:
-            self.model.enable_adapter_layers()
+        # Base LoRA adapter stays active — noise is additive on top
+        with BatchedNoiseContext(self.model, module_noise_params, candidate_ids):
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
 
         pad_id = self.tokenizer.pad_token_id
         results = []
