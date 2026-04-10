@@ -51,7 +51,6 @@ class Model:
             model_name,
             dtype=dtype,
             device_map=device_map,
-            attn_implementation="flash_attention_2",
         )
         self.base_model.eval()
 
