@@ -24,6 +24,74 @@ from .noise import StructuredNoise, build_batched_noise_params, generate_structu
 from .trace import ResponseLengths, TraceWriter
 
 
+def calibrate_sigma(
+    model: Model,
+    good_prompts: list[str],
+    base_logprobs: Tensor,
+    lora_names: list[str],
+    lora_shapes: list[tuple[int, ...]],
+    lora_rank: int,
+    target_kl: float = 0.1,
+    max_iterations: int = 15,
+    batch_size: int = 32,
+) -> float:
+    """Binary search for the sigma that produces target_kl divergence.
+
+    Finds the noise magnitude where the model's outputs change meaningfully
+    (KL ~0.1) without being destroyed (KL >> 1).
+    """
+    device = model.device
+    lo, hi = 1e-4, 1.0
+
+    log.info("calibrating_sigma", target_kl=target_kl)
+
+    for iteration in range(max_iterations):
+        mid = (lo + hi) / 2
+
+        # Generate one noise sample and apply as +noise
+        noise = generate_structured_noise(lora_names, lora_shapes, lora_rank, device)
+        noise_params = build_batched_noise_params([noise], [1.0], mid, device)
+
+        # Run a quick forward pass to measure KL
+        # We need to temporarily apply noise via hooks
+        prompt_texts = model.tokenize_prompts(good_prompts[:10])  # just 10 prompts for speed
+        candidate_ids = [0] * len(prompt_texts)
+
+        from .batched_lora import BatchedNoiseContext
+
+        inputs = model.processor(text=prompt_texts, return_tensors="pt", padding=True).to(device)
+        with BatchedNoiseContext(model.model, noise_params, torch.tensor(candidate_ids, device=device)):
+            with torch.no_grad():
+                outputs = model.model.generate(
+                    **inputs,
+                    max_new_tokens=1,
+                    output_scores=True,
+                    return_dict_in_generate=True,
+                    pad_token_id=model.tokenizer.pad_token_id,
+                    do_sample=False,
+                )
+        logits = outputs.scores[0]
+        noised_logprobs = torch.nn.functional.log_softmax(logits, dim=-1).cpu()
+        kl = torch.nn.functional.kl_div(
+            noised_logprobs, base_logprobs[:10], reduction="batchmean", log_target=True
+        ).item()
+
+        log.info("sigma_probe", iteration=iteration + 1, sigma=round(mid, 6), kl=round(kl, 4))
+
+        if abs(kl - target_kl) / target_kl < 0.3:  # within 30% of target
+            log.info("sigma_calibrated", sigma=round(mid, 6), kl=round(kl, 4))
+            return mid
+
+        if kl > target_kl:
+            hi = mid
+        else:
+            lo = mid
+
+    final_sigma = (lo + hi) / 2
+    log.info("sigma_calibrated", sigma=round(final_sigma, 6), note="max iterations reached")
+    return final_sigma
+
+
 def _fmt(seconds: float) -> str:
     if seconds < 60:
         return f"{seconds:.0f}s"
@@ -59,6 +127,42 @@ def evolve(
     lora_names_list = [n for n in lora_names]
     lora_shapes_list = [tuple(p.shape) for p in lora_shapes]
     lora_rank = model.lora_rank
+
+    # Auto-calibrate sigma if requested (noise_std=0 means auto)
+    if noise_std <= 0:
+        noise_std = calibrate_sigma(model, good_prompts, base_logprobs, lora_names_list, lora_shapes_list, lora_rank)
+    else:
+        # Validate the provided sigma with a quick KL check
+        test_noise = generate_structured_noise(lora_names_list, lora_shapes_list, lora_rank, device)
+        test_params = build_batched_noise_params([test_noise], [1.0], noise_std, device)
+
+        from .batched_lora import BatchedNoiseContext
+
+        test_texts = model.tokenize_prompts(good_prompts[:10])
+        test_inputs = model.processor(text=test_texts, return_tensors="pt", padding=True).to(device)
+        with BatchedNoiseContext(
+            model.model, test_params, torch.zeros(len(test_texts), dtype=torch.long, device=device)
+        ):
+            with torch.no_grad():
+                test_out = model.model.generate(
+                    **test_inputs,
+                    max_new_tokens=1,
+                    output_scores=True,
+                    return_dict_in_generate=True,
+                    pad_token_id=model.tokenizer.pad_token_id,
+                    do_sample=False,
+                )
+        test_logprobs = torch.nn.functional.log_softmax(test_out.scores[0], dim=-1).cpu()
+        test_kl = torch.nn.functional.kl_div(
+            test_logprobs, base_logprobs[:10], reduction="batchmean", log_target=True
+        ).item()
+        log.info("sigma_check", sigma=round(noise_std, 6), kl=round(test_kl, 4))
+        if test_kl > 1.0:
+            log.warning(
+                "sigma_too_high", sigma=noise_std, kl=test_kl, hint="Consider using --noise-std 0 for auto-calibration"
+            )
+
+    log.info("sigma_ready", sigma=round(noise_std, 6))
 
     best_score = float("-inf")
     best_compliance = 0

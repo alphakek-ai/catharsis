@@ -17,7 +17,7 @@ def run(
     lora_targets: Annotated[Optional[list[str]], typer.Option(help="LoRA target modules")] = None,
     population_size: Annotated[int, typer.Option(help="Candidates per generation")] = 16,
     generations: Annotated[int, typer.Option(help="Number of generations")] = 100,
-    noise_std: Annotated[float, typer.Option(help="Perturbation noise std")] = 0.01,
+    noise_std: Annotated[float, typer.Option(help="Perturbation noise std (0 = auto-calibrate)")] = 0.0,
     learning_rate: Annotated[float, typer.Option(help="ES gradient ascent learning rate")] = 0.01,
     kl_weight: Annotated[float, typer.Option(help="KL divergence penalty weight")] = 1.0,
     batch_size: Annotated[int, typer.Option(help="Inference batch size")] = 32,
