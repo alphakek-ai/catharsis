@@ -12,6 +12,7 @@ Pipeline per generation:
 
 import random
 import time
+from collections import Counter
 
 import torch
 from torch import Tensor
@@ -303,17 +304,22 @@ def evolve(
                     generation=gen + 1,
                     candidate=cand_idx + 1,
                     prompt_idx=prompt_idx,
+                    category=r.category,
+                    reward=r.reward,
                     is_refusal=r.is_refusal,
                     judge_lengths=r.lengths,
                     judge_reasoning=r.reasoning,
                     judge_error=r.error,
                 )
 
-            refusals = sum(1 for r in results if r.is_refusal is True or r.is_refusal is None)
+            # Compute mean reward from judge categories
+            mean_reward = sum(r.reward for r in results) / len(results)
+            refusals = sum(1 for r in results if r.is_refusal)
             n_errors = sum(1 for r in results if r.error is not None)
-            compliance_rate = 1.0 - (refusals / n_prompts)
             kl = candidate_kls[cand_idx]
-            score = compliance_rate - kl_weight * kl
+            score = mean_reward - kl_weight * kl
+
+            categories = Counter(r.category for r in results)
 
             if sign_label == "+":
                 scores_plus.append(score)
@@ -322,23 +328,20 @@ def evolve(
 
             gen_results = candidate_responses[cand_idx]
             total_tok = sorted(r.total_tokens for r in gen_results)
-            reasoning_tok = sorted(r.reasoning_tokens for r in gen_results)
-            judge_reasoning_tok = sorted(r.lengths.reasoning_tokens for r in results if r.lengths is not None)
             judge_total_tok = sorted(r.lengths.total_tokens for r in results if r.lengths is not None)
 
             log.info(
                 "candidate_eval",
                 generation=gen + 1,
                 candidate=f"{sign_label}{pair_idx + 1}",
-                compliance=round(compliance_rate * 100),
+                mean_reward=round(mean_reward, 3),
+                categories=dict(categories),
                 refusals=refusals,
                 judge_errors=n_errors,
                 kl=round(kl, 4),
                 score=round(score, 4),
                 student_tok_p50=total_tok[len(total_tok) // 2] if total_tok else 0,
                 student_tok_max=total_tok[-1] if total_tok else 0,
-                student_reasoning_p50=reasoning_tok[len(reasoning_tok) // 2] if reasoning_tok else 0,
-                judge_reasoning_p50=judge_reasoning_tok[len(judge_reasoning_tok) // 2] if judge_reasoning_tok else 0,
                 judge_tok_max=judge_total_tok[-1] if judge_total_tok else 0,
             )
 

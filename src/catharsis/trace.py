@@ -59,8 +59,10 @@ class TraceWriter:
         generation: int,
         candidate: int,
         prompt_idx: int,
-        is_refusal: bool | None,
-        judge_lengths: ResponseLengths | None,
+        category: str = "",
+        reward: float = 0.0,
+        is_refusal: bool | None = None,
+        judge_lengths: ResponseLengths | None = None,
         judge_reasoning: str = "",
         judge_error: str | None = None,
     ):
@@ -70,6 +72,9 @@ class TraceWriter:
             "cand": candidate,
             "idx": prompt_idx,
         }
+        if category:
+            data["category"] = category
+            data["reward"] = reward
         if is_refusal is not None:
             data["is_refusal"] = is_refusal
         if judge_lengths is not None:
