@@ -113,13 +113,13 @@ def evolve(
     noise_std: float = 0.01,
     kl_weight: float = 1.0,
     learning_rate: float = 0.01,
-    batch_size: int = 32,
+    kl_batch_size: int = 32,
     max_new_tokens: int = 2000,
-    prompts_per_step: int | None = None,
+    prompts_per_candidate: int | None = None,
     max_batch_sequences: int = 64,
 ) -> Tensor:
     n_pairs = population_size // 2
-    n_prompts = prompts_per_step or len(bad_prompts)
+    n_prompts = prompts_per_candidate or len(bad_prompts)
     n_candidates = n_pairs * 2
     device = model.device
 
@@ -183,7 +183,7 @@ def evolve(
         kl_weight=kl_weight,
         n_good=len(good_prompts),
         n_bad=len(bad_prompts),
-        prompts_per_step=n_prompts,
+        prompts_per_candidate=n_prompts,
         max_new_tokens=max_new_tokens,
         max_batch_sequences=max_batch_sequences,
     )
@@ -278,7 +278,7 @@ def evolve(
             # (noise was additive via hooks, not baked into weights)
             # KL for all candidates in this sub-batch is the SAME (base LoRA unchanged)
             # So we compute once and share
-            kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
+            kl = model.compute_kl(good_prompts, base_logprobs, batch_size=kl_batch_size)
             for cand_idx in batch_cand_indices:
                 candidate_kls[cand_idx] = kl
 
@@ -327,8 +327,19 @@ def evolve(
                 scores_minus.append(score)
 
             gen_results = candidate_responses[cand_idx]
-            total_tok = sorted(r.total_tokens for r in gen_results)
-            judge_total_tok = sorted(r.lengths.total_tokens for r in results if r.lengths is not None)
+
+            # Token stats excluding GIBBERISH (gibberish inflates stats meaninglessly)
+            non_gibberish = [
+                (r_gen, r_judge)
+                for r_gen, r_judge in zip(gen_results, results, strict=True)
+                if r_judge.category != "GIBBERISH"
+            ]
+            student_tok = sorted(r_gen.total_tokens for r_gen, _ in non_gibberish) if non_gibberish else []
+            judge_tok = (
+                sorted(r_judge.lengths.total_tokens for _, r_judge in non_gibberish if r_judge.lengths is not None)
+                if non_gibberish
+                else []
+            )
 
             log.info(
                 "candidate_eval",
@@ -340,9 +351,9 @@ def evolve(
                 judge_errors=n_errors,
                 kl=round(kl, 4),
                 score=round(score, 4),
-                student_tok_p50=total_tok[len(total_tok) // 2] if total_tok else 0,
-                student_tok_max=total_tok[-1] if total_tok else 0,
-                judge_tok_max=judge_total_tok[-1] if judge_total_tok else 0,
+                student_tok_p50=student_tok[len(student_tok) // 2] if student_tok else 0,
+                student_tok_max=student_tok[-1] if student_tok else 0,
+                judge_tok_max=judge_tok[-1] if judge_tok else 0,
             )
 
             for r in results:
@@ -401,7 +412,7 @@ def evolve(
 
         if mean_score > best_score:
             best_score = mean_score
-            best_kl = model.compute_kl(good_prompts, base_logprobs, batch_size=batch_size)
+            best_kl = model.compute_kl(good_prompts, base_logprobs, batch_size=kl_batch_size)
             best_compliance = round((best_score + kl_weight * best_kl) * 100)
             log.info("new_best", compliance=best_compliance, kl=round(best_kl, 4), score=round(best_score, 4))
 

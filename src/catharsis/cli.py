@@ -20,10 +20,14 @@ def run(
     noise_std: Annotated[float, typer.Option(help="Perturbation noise std (0 = auto-calibrate)")] = 0.0,
     learning_rate: Annotated[float, typer.Option(help="ES gradient ascent learning rate")] = 0.01,
     kl_weight: Annotated[float, typer.Option(help="KL divergence penalty weight")] = 1.0,
-    batch_size: Annotated[int, typer.Option(help="Inference batch size")] = 32,
+    kl_batch_size: Annotated[int, typer.Option(help="Batch size for KL divergence computation")] = 32,
     max_new_tokens: Annotated[int, typer.Option(help="Max tokens per response")] = 2000,
-    prompts_per_step: Annotated[int, typer.Option(help="Bad prompts sampled per generation step")] = 10,
-    max_batch_sequences: Annotated[int, typer.Option(help="Max sequences per generation sub-batch")] = 64,
+    prompts_per_candidate: Annotated[
+        int, typer.Option(help="Number of prompts each candidate answers per generation")
+    ] = 10,
+    max_batch_sequences: Annotated[
+        int, typer.Option(help="Max sequences per GPU generation sub-batch (controls VRAM)")
+    ] = 64,
     output_dir: Annotated[Optional[str], typer.Option(help="Output directory")] = None,
 ):
     """Run evolutionary LoRA search with LLM judge fitness."""
@@ -48,7 +52,7 @@ def run(
     log.info("prompts_loaded", good_eval=len(good_eval), bad_eval=len(bad_eval))
 
     log.info("computing_base_logprobs")
-    base_logprobs = m.get_base_logprobs(good_eval, batch_size=batch_size)
+    base_logprobs = m.get_base_logprobs(good_eval, batch_size=kl_batch_size)
     log.info("base_logprobs_ready")
 
     log.info(
@@ -57,7 +61,7 @@ def run(
         generations=generations,
         noise_std=noise_std,
         learning_rate=learning_rate,
-        prompts_per_step=prompts_per_step,
+        prompts_per_candidate=prompts_per_candidate,
     )
     evolve(
         model=m,
@@ -70,9 +74,9 @@ def run(
         noise_std=noise_std,
         kl_weight=kl_weight,
         learning_rate=learning_rate,
-        batch_size=batch_size,
+        kl_batch_size=kl_batch_size,
         max_new_tokens=max_new_tokens,
-        prompts_per_step=prompts_per_step,
+        prompts_per_candidate=prompts_per_candidate,
         max_batch_sequences=max_batch_sequences,
     )
 
