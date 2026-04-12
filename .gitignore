@@ -6,5 +6,4 @@ dist/
 .ruff_cache/
 traces/
 .idea/
-*.safetensors
-google--*/
+outputs/

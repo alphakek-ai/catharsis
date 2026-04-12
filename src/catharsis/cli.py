@@ -76,7 +76,7 @@ def run(
         max_batch_sequences=max_batch_sequences,
     )
 
-    out = output_dir or f"{model.replace('/', '--')}-catharsis"
+    out = output_dir or f"outputs/{model.replace('/', '--')}-catharsis"
     log.info("saving_model", output_dir=out)
     merged = m.model.merge_and_unload()
     merged.save_pretrained(out, safe_serialization=True)
