@@ -219,8 +219,8 @@ def evolve(
             candidate_signs.append(-1.0)
             candidate_labels.append(("-", pair_idx))
 
-        # Build stacked noise params for hooks (sigma decays linearly)
-        current_sigma = noise_std * (1.0 - gen / generations)
+        # Build stacked noise params for hooks (sigma decays with floor)
+        current_sigma = noise_std * max(0.3, 1.0 - gen / generations)
         all_noise_params = build_batched_noise_params(candidate_noises, candidate_signs, current_sigma, device)
 
         # How many candidates per sub-batch
@@ -360,9 +360,6 @@ def evolve(
         normalized_minus = [(s - score_mean) / score_std for s in scores_minus]
 
         # --- ES gradient update (per-module, structured) ---
-        # Sigma decays linearly over generations (like EGGROLL)
-        current_sigma = noise_std * (1.0 - gen / generations)
-
         for name, param in model.model.named_parameters():
             if "lora_" not in name or not param.requires_grad:
                 continue
@@ -379,14 +376,15 @@ def evolve(
                 np_score = normalized_plus[pair_idx]
                 nm_score = normalized_minus[pair_idx]
 
+                # Antithetic gradient: (score_+ - score_-) for both A and B.
+                # The perturbation direction is noise_B @ noise_A. When score_+ > score_-,
+                # we want to move toward BOTH noise_A and noise_B (they jointly produced
+                # the useful perturbation).
+                score_diff = np_score - nm_score
                 if is_A:
-                    noise_param = noise_A.to(param.device, param.dtype)
-                    grad += np_score * noise_param  # +noise direction
-                    grad += nm_score * (-noise_param)  # -noise direction (sign is in the noise)
+                    grad += score_diff * noise_A.to(param.device, param.dtype)
                 else:
-                    noise_param = noise_B.to(param.device, param.dtype)
-                    grad += np_score * noise_param
-                    grad += nm_score * noise_param  # B is not sign-flipped in EGGROLL
+                    grad += score_diff * noise_B.to(param.device, param.dtype)
 
             grad /= n_candidates
             param.data += learning_rate * grad
