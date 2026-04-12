@@ -219,8 +219,9 @@ def evolve(
             candidate_signs.append(-1.0)
             candidate_labels.append(("-", pair_idx))
 
-        # Build stacked noise params for hooks (sigma decays with floor)
-        current_sigma = noise_std * max(0.3, 1.0 - gen / generations)
+        # Sigma decays over a long horizon (not tied to current run length)
+        sigma_horizon = max(generations, 200)
+        current_sigma = noise_std * max(0.1, 1.0 - gen / sigma_horizon)
         all_noise_params = build_batched_noise_params(candidate_noises, candidate_signs, current_sigma, device)
 
         # How many candidates per sub-batch
