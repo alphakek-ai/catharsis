@@ -192,6 +192,9 @@ def evolve(
     total_steps = generations * n_candidates * n_prompts * 2
     pbar = tqdm(total=total_steps, desc="best=0%", unit="step")
 
+    log.info("lora_params", count=model.lora_param_count(), rank=lora_rank)
+
+    prev_grad: Tensor | None = None
     gen_start = time.perf_counter()
 
     for gen in range(generations):
@@ -401,6 +404,44 @@ def evolve(
             grad /= n_candidates
             param.data += learning_rate * grad
 
+        # --- Diagnostics: track update coherence ---
+        # Compute the full gradient as a flat vector for analysis
+        grad_flat_parts = []
+        for name, param in model.model.named_parameters():
+            if "lora_" not in name or not param.requires_grad:
+                continue
+            base_name = name.split(".lora_A.")[0] if ".lora_A." in name else name.split(".lora_B.")[0]
+            is_A = ".lora_A." in name
+            grad = torch.zeros_like(param)
+            for pair_idx, noise in enumerate(noise_samples):
+                if base_name not in noise.module_noise:
+                    continue
+                noise_A, noise_B = noise.module_noise[base_name]
+                score_diff = normalized_plus[pair_idx] - normalized_minus[pair_idx]
+                if is_A:
+                    grad += score_diff * noise_A.to(param.device, param.dtype)
+                else:
+                    grad += score_diff * noise_B.to(param.device, param.dtype)
+            grad /= n_candidates
+            grad_flat_parts.append(grad.flatten())
+
+        current_grad_flat = torch.cat(grad_flat_parts)
+        grad_norm = current_grad_flat.norm().item()
+
+        # Cosine similarity with previous gradient (direction consistency)
+        if prev_grad is not None:
+            cos_sim = torch.nn.functional.cosine_similarity(
+                current_grad_flat.unsqueeze(0), prev_grad.unsqueeze(0)
+            ).item()
+        else:
+            cos_sim = 0.0
+        prev_grad = current_grad_flat.detach().clone()
+
+        # LoRA weight stats
+        lora_flat = model.get_lora_flat()
+        lora_norm = lora_flat.norm().item()
+        update_norm = (learning_rate * current_grad_flat).norm().item()
+
         mean_score = sum(scores_plus) / len(scores_plus)
         log.info(
             "es_update",
@@ -409,6 +450,11 @@ def evolve(
             mean_score_plus=round(sum(scores_plus) / len(scores_plus), 4),
             mean_score_minus=round(sum(scores_minus) / len(scores_minus), 4),
             score_std=round(score_std, 4),
+            grad_norm=round(grad_norm, 6),
+            grad_cos_sim=round(cos_sim, 4),
+            lora_norm=round(lora_norm, 4),
+            update_norm=round(update_norm, 6),
+            update_to_weight_ratio=round(update_norm / max(lora_norm, 1e-8), 6),
         )
 
         if mean_score > best_score:
